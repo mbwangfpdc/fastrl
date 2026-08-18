@@ -40,6 +40,16 @@ def add_args():
     parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for distributed training")
     parser.add_argument("--load_optimizer", action="store_true", help="Whether to load optimizer states")
     parser.add_argument("--precision", type=str, default="fp16", choices=["fp16", "bf16"], help="Training precision type")
+    parser.add_argument(
+        "--warm_start_ckpt",
+        type=str,
+        default=None,
+        help=(
+            "Optional EAGLE checkpoint (.bin) to initialise the drafter from, instead of "
+            "training from scratch. Must share the architecture derived from --base_model_path; "
+            "mismatched shapes raise rather than being silently skipped."
+        ),
+    )
     parser = deepspeed.add_config_arguments(parser)
     return parser
 
@@ -210,9 +220,46 @@ class EagleTrainerDeepSpeed:
 
         self.model = model_class(config=config)
 
+        # Optional warm start from an existing EAGLE drafter of the same derived
+        # architecture. Because the config above comes from the *target*, a
+        # Qwen2.5-7B-family drafter (e.g. mit-han-lab/Qwen2.5-7B-Eagle-RL)
+        # matches exactly: verified 0 shape mismatches, 0 unexpected keys, only
+        # `lm_head.weight` missing -- which _load_base_model_weights() supplies.
+        #
+        # ORDER MATTERS: this runs BEFORE _load_base_model_weights(). The
+        # checkpoint carries its own `embed_tokens.weight` from whatever model it
+        # was trained against; loading it afterwards would overwrite the target's
+        # embeddings with the wrong ones. Loading first lets the target win.
+        if getattr(self.args, "warm_start_ckpt", None):
+            self._warm_start_from(self.args.warm_start_ckpt)
+
         # Load embeddings and LM head from base model
         self._load_base_model_weights()
         self.model.to(dtype=config.dtype)
+
+    def _warm_start_from(self, ckpt_path):
+        """Initialise the drafter from an existing EAGLE checkpoint."""
+        state = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        own = self.model.state_dict()
+
+        # Checkpoints are saved without the `model.` prefix this class uses.
+        remapped = {}
+        for k, v in state.items():
+            remapped[f"model.{k}" if (k not in own and f"model.{k}" in own) else k] = v
+
+        bad = [k for k, v in remapped.items() if k in own and own[k].shape != v.shape]
+        if bad:
+            raise ValueError(
+                f"warm-start checkpoint {ckpt_path} is not architecture-compatible: "
+                f"{len(bad)} shape mismatches, first few {bad[:5]}"
+            )
+
+        result = self.model.load_state_dict(remapped, strict=False)
+        if self.local_rank == 0:
+            print(
+                f"[warm start] {ckpt_path}: loaded {len(remapped)} tensors, "
+                f"missing={result.missing_keys}, unexpected={result.unexpected_keys}"
+            )
 
     def _load_base_model_weights(self):
         base_path = self.args.base_model_path

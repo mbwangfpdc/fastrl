@@ -1,0 +1,6 @@
+# flashinfer-python==0.4.0 (pinned by sglang 0.5.3.post2) requires
+# apache-tvm-ffi==0.1.0b15, but every 0.1.0b* prerelease has been deleted from
+# PyPI, so that pin is unsatisfiable by any installer (pip or uv).
+# 0.1.0 is the final release of that same line (b15 -> 0.1.0, ~2 weeks later);
+# flashinfer 0.5.0+ relaxed its own pin to `apache-tvm-ffi>=0.1,<0.2`.
+apache-tvm-ffi==0.1.0

@@ -129,3 +129,12 @@ logs
 log
 outputs
 .history
+# --- local SkyRL-SQL baseline work (mbwang) ---
+# Run/benchmark logs and rollout dumps — evidence for examples/sql/README.md,
+# but regenerable and not worth versioning.
+output/
+speculative_*_stats.csv
+# EAGLE drafter training corpus (parquet) and machine-specific symlinks into
+# the local HF cache; both are rebuilt by eagle-train/scripts/*.
+data/eagle_corpus/
+eagle-train/models/

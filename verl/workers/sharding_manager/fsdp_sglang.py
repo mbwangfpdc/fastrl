@@ -113,18 +113,32 @@ class FSDPSGLangShardingManager(BaseShardingManager):
 
         self.drafter_module = None
         
+    @staticmethod
+    def _loop() -> asyncio.AbstractEventLoop:
+        # asyncio.get_event_loop() raises under Python 3.12 + uvloop when the
+        # calling thread has no loop set.
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
+
     @GPUMemoryLogger(role="FSDPSGLangShardingManager enter", logger=logger)
     def __enter__(self):
         self.timing = {}
         with simple_timer("reshard", self.timing):
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self.wake_up())
+            self._loop().run_until_complete(self.wake_up())
 
     @GPUMemoryLogger(role="FSDPSGLangShardingManager exit", logger=logger)
     def __exit__(self, exc_type, exc_value, traceback):
-        pass
-        # loop = asyncio.get_event_loop()
-        # loop.run_until_complete(self.sleep())
+        # Upstream FastRL leaves the engine resident here (the sleep call was
+        # commented out), which is affordable on 80GB cards but not on a 44GB
+        # L40S: the engine's ~18GB (weights + KV at gpu_memory_utilization) stays
+        # pinned through the training step and OOMs the backward pass.
+        # `sleep()` gates the actual release on rollout.free_cache_engine, and
+        # `__enter__`'s wake_up() already handles resume + weight refresh.
+        self._loop().run_until_complete(self.sleep())
 
     async def update_weights(self, params):
         named_tensors = [(k, v) for k, v in params.items()]

@@ -83,6 +83,23 @@ except ImportError:
 
 
 logger = logging.getLogger(__file__)
+
+
+def _get_or_create_event_loop() -> asyncio.AbstractEventLoop:
+    """Return a usable event loop for the current thread.
+
+    `asyncio.get_event_loop()` raises under Python 3.12 + uvloop when no loop is
+    set for the calling thread, which is the case in the Ray worker threads that
+    construct SGLangRollout. Inside a coroutine it still returns the running loop.
+    """
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # patch to avoid issue https://github.com/sgl-project/sglang/issues/6723
@@ -342,7 +359,7 @@ class SGLangRollout(BaseRollout):
                 raise ValueError(f"Cannot get pad_token_id from processing_class {self.processing_class}") from e
 
         self.drafter_manager = RolloutDrafterManager(device_mesh=self._device_mesh_cpu, rollout_config=self.config)
-        loop = asyncio.get_event_loop()
+        loop = _get_or_create_event_loop()
         loop.run_until_complete(self.drafter_manager.initialize())
         self._training_check_task = None
         self._batch_completion_event = asyncio.Event()
@@ -467,6 +484,13 @@ class SGLangRollout(BaseRollout):
                 model_path=actor_module,
                 dtype=self.config.dtype,
                 mem_fraction_static=self.config.gpu_memory_utilization,
+                # rollout.enforce_eager existed in the config but was never passed
+                # to sglang. Its CUDA-graph replay asserts on token counts far from
+                # the captured shapes, which the speculative-decoding path hits on
+                # long multi-turn SQL prompts ("size of tensor a (28) must match
+                # tensor b (2635)"). granular-cais-rl's sql_baseline.toml sets
+                # vllm_enforce_eager = true for the same workload.
+                disable_cuda_graph=bool(self.config.get("enforce_eager", False)),
                 enable_memory_saver=True,
                 base_gpu_id=0,
                 gpu_id_step=1,
@@ -748,7 +772,7 @@ class SGLangRollout(BaseRollout):
         # Update with any additional kwargs
         request_sampling_params.update(kwargs)
         if self._tp_rank == 0:
-            loop = asyncio.get_event_loop()
+            loop = _get_or_create_event_loop()
 
             output = loop.run_until_complete(self._generate_with_drafter(idx_list, image_list, request_sampling_params))
         else:
@@ -945,7 +969,7 @@ class SGLangRollout(BaseRollout):
 
         # free cache engine
         if self._engine is not None and self._tp_rank == 0:
-            loop = asyncio.get_event_loop()
+            loop = _get_or_create_event_loop()
             loop.run_until_complete(self._engine.flush_cache())
 
         # Signal batch completion
@@ -953,7 +977,7 @@ class SGLangRollout(BaseRollout):
 
         # Mark completion
         if self.drafter_manager:
-            loop = asyncio.get_event_loop()
+            loop = _get_or_create_event_loop()
             current_worker_id = dist.get_rank()
 
             logger.info(f"Worker {current_worker_id} generation completed, marking as completed")
@@ -973,7 +997,7 @@ class SGLangRollout(BaseRollout):
 
                 # Wait for cleanup event with timeout (run in thread to avoid blocking asyncio)
                 cleanup_done = loop.run_until_complete(
-                    asyncio.get_event_loop().run_in_executor(
+                    _get_or_create_event_loop().run_in_executor(
                         None, self.drafter_manager._training_cleanup_complete.wait, 10.0
                     )
                 )
@@ -1322,7 +1346,7 @@ class SGLangRollout(BaseRollout):
             req_list = self._preprocess_prompt_to_async_rollout_requests(
                 prompts,
             )
-            loop = asyncio.get_event_loop()
+            loop = _get_or_create_event_loop()
             output_req_list = loop.run_until_complete(
                 asyncio.gather(
                     *[self._async_rollout_a_request(req, do_sample, is_validate, **kwargs) for req in req_list],
@@ -1494,7 +1518,7 @@ class SGLangRollout(BaseRollout):
 
         # free cache engine
         if self._engine is not None and self._tp_rank == 0:
-            loop = asyncio.get_event_loop()
+            loop = _get_or_create_event_loop()
             loop.run_until_complete(self._engine.flush_cache())
 
         non_tensor_batch = {
@@ -1570,10 +1594,11 @@ class SGLangRollout(BaseRollout):
                 max_response_len=self.config.response_length,
                 max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
                 use_inference_chat_template=self.config.multi_turn.use_inference_chat_template,
+                use_conversation_multi_turn=self.config.multi_turn.get("use_conversation_multi_turn", True),
                 tokenization_sanity_check_mode=self.config.multi_turn.tokenization_sanity_check_mode,
                 processing_class=self.processing_class,
             )
-            error_message = f"""Request {req.request_id} has mismatched lengths: 
+            error_message = f"""Request {req.request_id} has mismatched lengths:
             input_ids={req.input_ids.shape[-1]}, 
             attention_mask={req.attention_mask.shape[-1]}, 
             position_ids={req.position_ids.shape[-1]}, 

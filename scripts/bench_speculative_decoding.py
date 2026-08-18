@@ -26,6 +26,11 @@ def main():
     parser.add_argument("--speculative_num_draft_tokens", type=int, default=64, help="Number of draft tokens")
     parser.add_argument("--max_bs", type=int, default=8, help="Max batch size")
     parser.add_argument("--attention_backend", type=str, default="fa3", help="Attention backend to use")
+    # Added: the SkyRL-SQL prompts carry a full DB schema and run past the
+    # hardcoded 4096 context, and the engine fraction needs to flex per drafter
+    # (an MHA drafter's draft-KV is ~7x an equivalent GQA one).
+    parser.add_argument("--context_length", type=int, default=4096)
+    parser.add_argument("--mem_fraction_static", type=float, default=0.6)
 
     args = parser.parse_args()
 
@@ -77,8 +82,8 @@ def main():
         cuda_graph_max_bs=args.max_bs,
         tp_size=args.tp_size,
         max_running_requests=args.max_bs,
-        mem_fraction_static=0.6,
-        context_length=4096,
+        mem_fraction_static=args.mem_fraction_static,
+        context_length=args.context_length,
         attention_backend=args.attention_backend,
         **speculative_args,
     )

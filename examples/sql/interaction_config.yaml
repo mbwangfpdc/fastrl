@@ -1,0 +1,20 @@
+# Interaction config for the SkyRL-SQL workload.
+#
+# Referenced via:
+#   actor_rollout_ref.rollout.multi_turn.interaction_config_path=examples/sql/interaction_config.yaml
+#
+# `name` is what a sample selects through extra_info.interaction_kwargs.name.
+# Leave multi_turn.tool_config_path unset: SkyRL-SQL uses raw <sql> tags, not
+# JSON tool calls, so no function-call parser should be installed.
+interaction:
+  - name: sql
+    class_name: verl.interactions.sql_interaction.SQLInteraction
+    config:
+      # Root of the text2sql database tree: the directory holding
+      # SynSQL-2.5M/, spider/ and bird/.
+      db_path: /local_nvme1/mborjigi/data/text2sql-data/data
+      # Assistant-turn budget when a sample carries no `max_turns` of its own.
+      # Keep actor_rollout_ref.rollout.multi_turn.max_assistant_turns strictly
+      # greater than this so the env, not verl, decides when an episode ends.
+      max_turns: 5
+      default_task: synsql

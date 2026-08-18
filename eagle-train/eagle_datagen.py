@@ -3,6 +3,15 @@ import json
 import logging
 import torch
 import torch.distributed as dist
+
+# Must precede `transformers`. When deepspeed is installed, transformers'
+# modeling_utils imports it at module scope, while deepspeed's hybrid_engine
+# reaches back into transformers.models.opt -- so importing transformers first
+# leaves modeling_utils half-initialised and the whole thing dies with
+# "cannot import name 'PreTrainedModel' from partially initialized module".
+# Importing deepspeed up front breaks the cycle.
+import deepspeed  # noqa: F401  (import order matters, not the name)
+
 import hydra
 import pandas as pd
 from pathlib import Path

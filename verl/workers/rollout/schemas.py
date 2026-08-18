@@ -116,6 +116,14 @@ class AsyncRolloutRequest(BaseModel):
 
     use_inference_chat_template: bool
     tokenization_sanity_check_mode: TokenizationSanityCheckModeEnum
+    # When False, the whole episode is ONE assistant turn: model output and
+    # environment observations are appended as raw tokens, with no per-turn
+    # chat-template role wrapping and no repeated generation prompt. This is the
+    # SkyRL convention (`use_conversation_multi_turn=false`) that the SkyRL-SQL
+    # workload is defined with -- its reward parser requires the text after
+    # every `</observation>` to start with `<think>`, which the templated form
+    # breaks by interposing the literal role word.
+    use_conversation_multi_turn: bool = True
     generation_prompt_ids: Optional[torch.Tensor] = None
     base_conv_wo_gen_prompt_end_pos: int
     base_conv_with_gen_prompt_end_pos: int
@@ -342,6 +350,24 @@ class AsyncRolloutRequest(BaseModel):
                 else input_tensor
             )
 
+    def _append_raw_text(
+        self,
+        processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin,
+        content: str,
+        loss_mask: bool,
+    ) -> None:
+        """Append `content` as bare tokens, with no chat-template wrapping.
+
+        Used by the single-continuous-turn mode (`use_conversation_multi_turn`
+        False), where model output and observations share one assistant stream.
+        """
+        tokenizer = getattr(processing_class, "tokenizer", processing_class)
+        token_ids = tokenizer.encode(content, add_special_tokens=False)
+        if not token_ids:
+            return
+        new_input_ids = torch.tensor(token_ids, dtype=self.input_ids.dtype, device=self.input_ids.device).unsqueeze(0)
+        self._update_input_ids(processing_class, new_input_ids, attention_mask=True, loss_mask=loss_mask)
+
     def get_generation_prompt_ids(
         self, processing_class: PreTrainedTokenizer | PreTrainedTokenizerFast | ProcessorMixin
     ) -> list[int]:
@@ -350,6 +376,18 @@ class AsyncRolloutRequest(BaseModel):
 
         Because rollout engine(SGLang) requires the ids to be a list, we need to convert the tensor to a list.
         """
+        if not self.use_conversation_multi_turn:
+            # Single continuous assistant turn: the generation prompt is emitted
+            # once, right after the initial prompt. Re-emitting it on later turns
+            # would reopen a chat turn mid-stream.
+            if not any(msg.role == "assistant" for msg in self.messages):
+                tail = self.input_ids[..., -self.generation_prompt_ids.shape[-1] :]
+                if not tail.eq(self.generation_prompt_ids).all():
+                    self._update_input_ids(
+                        processing_class, self.generation_prompt_ids, attention_mask=True, loss_mask=False
+                    )
+            return self.input_ids.squeeze(0).tolist()
+
         generation_prompt_ids = (
             None
             if self.input_ids[..., -self.generation_prompt_ids.shape[-1] :].eq(self.generation_prompt_ids).all()
@@ -379,6 +417,10 @@ class AsyncRolloutRequest(BaseModel):
         content: str,
     ) -> None:
         self.messages.append(Message(role="user", content=content))
+        if not self.use_conversation_multi_turn:
+            # Raw append: the observation is part of the same assistant stream.
+            self._append_raw_text(processing_class, content, loss_mask=False)
+            return
         messages = [*BASE_CHAT_HISTORY, self.messages[-1]]
         tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None
 
@@ -396,6 +438,12 @@ class AsyncRolloutRequest(BaseModel):
         tool_calls: Optional[list[OpenAIFunctionToolCall]] = None,
     ) -> None:
         self.messages.append(Message(role="assistant", content=content, tool_calls=tool_calls))
+
+        if not self.use_conversation_multi_turn:
+            # Raw append: no per-turn <|im_end|>, so the stream stays open for the
+            # observation and the next turn's continuation.
+            self._append_raw_text(processing_class, content, loss_mask=True)
+            return
 
         messages = [*BASE_CHAT_HISTORY, self.messages[-1]]
         tools = [tool.model_dump() for tool in self.tool_schemas] if self.tool_schemas else None

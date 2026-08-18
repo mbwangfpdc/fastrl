@@ -1,0 +1,57 @@
+{
+    "_comment": [
+        "Adaptation config for warm-started SQL drafter training. Differs from",
+        "config/deepspeed_config.json in three ways that matter:",
+        "  1. warmup_num_steps 12000 -> 50 and total_num_steps 800000 -> 1500.",
+        "     Upstream's values assume a from-scratch run over a huge corpus. Our",
+        "     corpus is 1959 trajectories = ~490 steps/epoch, so a 12000-step",
+        "     warmup would hold the LR near zero for ~24 epochs and the run would",
+        "     look like it was doing nothing.",
+        "  2. warmup_max_lr 5e-5 -> 1.5e-5. This is domain adaptation from a good",
+        "     initialisation, not from-scratch, so a gentler LR avoids washing out",
+        "     the warm start.",
+        "  3. train_micro_batch_size_per_gpu 4 -> 1. The collator pads EVERY batch to",
+        "     the global max (8192 here, vs 2048 in upstream's example), so the",
+        "     lm_head materialises (B x 8192 x 152064) logits every step. At B=2",
+        "     the prob-loss upcast alone asks for 9.28GB and OOMs a 44GB L40S."
+    ],
+    "bf16": {
+        "enabled": true
+    },
+    "optimizer": {
+        "type": "AdamW",
+        "params": {
+            "lr": 0,
+            "weight_decay": 0.0,
+            "adam_w_mode": true,
+            "betas": [
+                0.9,
+                0.95
+            ]
+        }
+    },
+    "scheduler": {
+        "type": "WarmupDecayLR",
+        "params": {
+            "warmup_min_lr": 0,
+            "warmup_max_lr": 1.5e-05,
+            "warmup_num_steps": 50,
+            "total_num_steps": 1500
+        }
+    },
+    "zero_optimization": {
+        "stage": 2,
+        "stage3_gather_16bit_weights_on_model_save": true,
+        "allgather_partitions": true,
+        "allgather_bucket_size": 200000000.0,
+        "overlap_comm": true,
+        "reduce_scatter": true,
+        "reduce_bucket_size": 200000000.0,
+        "contiguous_gradients": true
+    },
+    "gradient_accumulation_steps": 1,
+    "gradient_clipping": 0.5,
+    "steps_per_print": 50,
+    "train_micro_batch_size_per_gpu": 1,
+    "wall_clock_breakdown": false
+}
