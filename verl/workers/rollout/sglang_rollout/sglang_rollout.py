@@ -525,6 +525,26 @@ class SGLangRollout(BaseRollout):
         else:
             self._engine = None
 
+        # The KV pool is the scheduling budget, and it is NOT comparable across
+        # engines at equal `mem_fraction_static` / `gpu_memory_utilization`:
+        # sglang sizes it as (memory free after weights) - total*(1 - frac),
+        # while vLLM's fraction is a total budget inclusive of weights. Log the
+        # resulting token count so a cross-engine A/B can match the outcome
+        # instead of the knob. It also differs from a standalone probe, because
+        # the co-resident FSDP actor reduces the free memory sglang measures.
+        if self._engine is not None:
+            try:
+                # print, not logger.info: Ray's worker logging drops INFO here,
+                # so the number never reaches the run log.
+                print(
+                    f"[engine-ab] sglang KV pool: max_total_num_tokens="
+                    f"{getattr(self._engine.tokenizer_manager, 'max_total_num_tokens', '?')} "
+                    f"(mem_fraction_static={self.config.gpu_memory_utilization})",
+                    flush=True,
+                )
+            except Exception as e:  # never let instrumentation break a run
+                print(f"[engine-ab] could not read sglang KV pool: {e}", flush=True)
+
         self.sharding_manager = None
         self.is_sleep = True
 
