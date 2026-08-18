@@ -20,6 +20,10 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+
+# Rollout-only: run generation each step and skip everything after it, so the
+# inference engine can be timed without old_log_prob/update_actor in the way.
+_ROLLOUT_ONLY = os.environ.get("FASTRL_ROLLOUT_ONLY", "").strip() not in ("", "0", "false", "False")
 import uuid
 import warnings
 from collections import defaultdict
@@ -1180,6 +1184,35 @@ class RayPPOTrainer:
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
+                    # Rollout-only mode (FASTRL_ROLLOUT_ONLY=1): stop the step
+                    # after generation. Exists so the engine can be timed on its
+                    # own -- note `gen` also covers the sharding manager's
+                    # wake + weight sync (`reshard`), so `generate_sequences` is
+                    # the inference number and `gen` is not.
+                    if _ROLLOUT_ONLY:
+                        _gs = timing_raw.get("generate_sequences")
+                        pprint(
+                            f"[rollout-only] step={self.global_steps} "
+                            f"generate_sequences={_gs:.2f}s "
+                            f"gen={timing_raw.get('gen', float('nan')):.2f}s "
+                            f"reshard={timing_raw.get('reshard', float('nan')):.2f}s"
+                            if _gs is not None
+                            else f"[rollout-only] step={self.global_steps} timing={timing_raw}"
+                        )
+                        logger.log(
+                            data={
+                                "training/global_step": self.global_steps,
+                                **{f"timing_s/{k}": v for k, v in timing_raw.items()},
+                            },
+                            step=self.global_steps,
+                        )
+                        progress_bar.update(1)
+                        self.global_steps += 1
+                        if is_last_step:
+                            progress_bar.close()
+                            return
+                        continue
+
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 

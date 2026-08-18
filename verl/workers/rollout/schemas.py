@@ -124,6 +124,12 @@ class AsyncRolloutRequest(BaseModel):
     # every `</observation>` to start with `<think>`, which the templated form
     # breaks by interposing the literal role word.
     use_conversation_multi_turn: bool = True
+    # Identity for the rollout trace (rollout_trace_sink.py). `trace_row_index`
+    # is the DATASET row id, carried end-to-end so a trace stays joinable no
+    # matter how the batch is chunked across rollout workers; `trace_rep` is
+    # which of the rollout.n replicas of that row this request is.
+    trace_row_index: Optional[int] = None
+    trace_rep: int = 0
     generation_prompt_ids: Optional[torch.Tensor] = None
     base_conv_wo_gen_prompt_end_pos: int
     base_conv_with_gen_prompt_end_pos: int

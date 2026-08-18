@@ -61,6 +61,7 @@ from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.net_utils import is_ipv6
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
+from verl.workers.rollout import rollout_trace_sink
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.schemas import (
     AsyncRolloutRequest,
@@ -1070,6 +1071,14 @@ class SGLangRollout(BaseRollout):
         user_turns = 0
         user_turn_rewards = []
 
+        # Rollout trace (no-op unless FASTRL_ROLLOUT_TRACE is set). One entry per
+        # engine call; the following interaction's service time and observation
+        # are attached back onto it, so a turn record is "what the engine did,
+        # then what the environment cost".
+        _tracing = rollout_trace_sink.enabled()
+        _trace_turns: list[dict] = []
+        _trace_env_init_s = 0.0
+
         # Create request-level sampling parameters
         request_sampling_params = self.sampling_params.copy()
         if not do_sample:
@@ -1104,7 +1113,9 @@ class SGLangRollout(BaseRollout):
 
         while current_turns < self.config.multi_turn.max_assistant_turns:
             if _req.state == AsyncRolloutRequestStateEnum.PENDING:
+                _t0 = time.perf_counter()
                 await self._handle_pending_state(_req)
+                _trace_env_init_s += time.perf_counter() - _t0
                 _req.state = AsyncRolloutRequestStateEnum.RUNNING
             elif _req.state == AsyncRolloutRequestStateEnum.TOOL_CALLING:
                 if _req.messages[-1].tool_calls is not None:
@@ -1152,7 +1163,25 @@ class SGLangRollout(BaseRollout):
                         "video support is not implemented yet, current length of video data is %d", len(video_data)
                     )
 
+                _t0 = time.perf_counter()
                 output = await self._handle_engine_call(_req, request_sampling_params, image_data=image_data)
+                if _tracing:
+                    _mi = output.get("meta_info") or {}
+                    _trace_turns.append(
+                        {
+                            # What the engine itself reported, not what we think
+                            # we sent: prompt_tokens is the full resent context,
+                            # cached_tokens the part the radix cache served.
+                            "prefill_tokens": _mi.get("prompt_tokens"),
+                            "decode_tokens": _mi.get("completion_tokens"),
+                            "cached_tokens": _mi.get("cached_tokens"),
+                            "gen_s": time.perf_counter() - _t0,
+                            "finish_reason": (_mi.get("finish_reason") or {}).get("type", ""),
+                            "env_step_s": 0.0,
+                            "reward": 0.0,
+                            "done": True,
+                        }
+                    )
                 content = output["text"]
                 finish_reason_type = FinishReasonTypeEnum.from_str(output["meta_info"]["finish_reason"]["type"])
                 current_turns += 1
@@ -1226,9 +1255,14 @@ class SGLangRollout(BaseRollout):
                     )
 
                 interaction = self.interaction_map[interaction_name]
+                _t0 = time.perf_counter()
                 should_terminate_sequence, content, reward, metrics = await interaction.generate_response(
                     _req.request_id, messages, **_req.interaction_kwargs
                 )
+                if _tracing and _trace_turns:
+                    _trace_turns[-1]["env_step_s"] = time.perf_counter() - _t0
+                    _trace_turns[-1]["reward"] = float(reward) if reward is not None else 0.0
+                    _trace_turns[-1]["done"] = bool(should_terminate_sequence)
                 user_turn_rewards.append(reward)
                 if should_terminate_sequence:
                     finish_reason_type = FinishReasonTypeEnum.STOP
@@ -1272,6 +1306,19 @@ class SGLangRollout(BaseRollout):
             )
             # len(input_token_logprobs) = len(input_tokens)-1，because logprob of 1st token is None
             _req.output_token_ids, _req.rollout_log_probs = _extract_logprob_from_output(output)
+        if _tracing:
+            rollout_trace_sink.emit(
+                {
+                    "step": rollout_trace_sink.current_step(),
+                    "row_index": _req.trace_row_index,
+                    "rep": _req.trace_rep,
+                    "env_init_s": _trace_env_init_s,
+                    "turns": _trace_turns,
+                    "stop_reason": str(finish_reason_type.value if finish_reason_type else ""),
+                    "reward": float(user_turn_rewards[-1]) if user_turn_rewards else 0.0,
+                    "response_tokens": int(_req.response_ids.shape[-1]) if _req.response_ids is not None else 0,
+                }
+            )
         return _req
 
     async def _handle_engine_call(
@@ -1342,6 +1389,11 @@ class SGLangRollout(BaseRollout):
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         tgt_device = prompts.batch["input_ids"].device
+        # The trace sink lives in this worker process, so the step has to be
+        # stamped here rather than on the driver; ray_trainer puts it in
+        # meta_info before dispatching the batch.
+        if rollout_trace_sink.enabled() and not is_validate:
+            rollout_trace_sink.set_step(int(prompts.meta_info.get("global_steps", -1)))
         if self._tp_rank == 0:
             req_list = self._preprocess_prompt_to_async_rollout_requests(
                 prompts,
@@ -1551,6 +1603,20 @@ class SGLangRollout(BaseRollout):
             "multi_modal_data", [None] * len(prompts.non_tensor_batch["raw_prompt"])
         )
 
+        # Trace identity. `index` is the dataset row id (RLHFDataset copies it
+        # from extra_info), which survives the DP chunking of the batch across
+        # rollout workers -- batch_data_id does not, it is local to this chunk.
+        # ray_trainer repeats each prompt rollout.n times with interleave=True,
+        # so a row's replicas are adjacent and counting occurrences recovers the
+        # replica index without assuming the chunk boundary is n-aligned.
+        _row_index_col = prompts.non_tensor_batch.get("index")
+        _trace_row_index, _trace_rep, _seen = [], [], {}
+        for _i in range(len(prompts.non_tensor_batch["raw_prompt"])):
+            _ri = int(_row_index_col[_i]) if _row_index_col is not None else -1
+            _trace_row_index.append(_ri)
+            _trace_rep.append(_seen.get(_ri, 0))
+            _seen[_ri] = _seen.get(_ri, 0) + 1
+
         for data_idx, (raw_prompt, multi_modal_data) in enumerate(
             zip(prompts.non_tensor_batch["raw_prompt"], multi_modal_data_list, strict=True)
         ):
@@ -1576,6 +1642,8 @@ class SGLangRollout(BaseRollout):
             req = AsyncRolloutRequest(
                 batch_data_id=data_idx,
                 rollout_offset=0,
+                trace_row_index=_trace_row_index[data_idx],
+                trace_rep=_trace_rep[data_idx],
                 request_id=str(uuid4()),
                 state=AsyncRolloutRequestStateEnum.PENDING,
                 messages=list(raw_prompt),

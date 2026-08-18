@@ -68,6 +68,12 @@ EXPERIMENT_NAME=${EXPERIMENT_NAME:-baseline-sd${SPECULATIVE}}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-Coder-7B-Instruct}
 SPEC_MODEL_PATH=${SPEC_MODEL_PATH:-mit-han-lab/Qwen2.5-7B-Eagle-RL}
 DATA_PATH=${DATA_PATH:-data/skyrl_sql}
+TRAIN_FILE=${TRAIN_FILE:-$DATA_PATH/train.parquet}
+VAL_FILE=${VAL_FILE:-$DATA_PATH/validation.parquet}
+# Set false only for cross-system A/Bs, where another framework has to walk the
+# same rows in the same order (SequentialSampler); see
+# granular-cais-rl/engine_ab_sglang_vs_vllm_plan.md.
+DATA_SHUFFLE=${DATA_SHUFFLE:-True}
 
 NGPUS=${NGPUS:-4}
 TP=${TP:-1}
@@ -126,8 +132,9 @@ sleep 3
     speculative.train.enable_drafter_training=${DRAFTER_TRAINING:-False} \
     speculative.train.collect_hidden_states_from_sgl=${DRAFTER_COLLECT_SGL:-False} \
     speculative.train.training_interval_steps=${DRAFTER_INTERVAL:-10} \
-    data.train_files=$DATA_PATH/train.parquet \
-    data.val_files=$DATA_PATH/validation.parquet \
+    data.train_files=$TRAIN_FILE \
+    data.val_files=$VAL_FILE \
+    data.shuffle=${DATA_SHUFFLE} \
     data.return_raw_chat=True \
     data.return_full_prompt=True \
     data.train_batch_size=${train_prompt_bsz} \
