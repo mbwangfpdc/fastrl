@@ -1436,6 +1436,17 @@ class SGLangRollout(BaseRollout):
             src=self._device_mesh_cpu["tp"].mesh[0].item(),
             force_cpu_device=False,
         )
+
+        # Opportunistic drafter training: hand the GPU over now that every
+        # trajectory is finished. This mirrors the tail of _generate_with_drafter,
+        # which only exists on the single-turn path -- without it the coordinator
+        # is never told a worker is free, _check_and_start_training never fires,
+        # and drafter training is unreachable in multi-turn no matter how it is
+        # configured. The release point is the same in both modes (all generation
+        # done, training not yet started); multi-turn just reaches it after a
+        # loop of engine calls rather than one.
+        self._drafter_release_after_generation(is_validate)
+
         # Construct the batch data
         prompt_ids, response_ids = [], []
         prompt_attention_mask, response_attention_mask = [], []
@@ -1606,10 +1617,70 @@ class SGLangRollout(BaseRollout):
         if is_multimodal:
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs, dtype=object)
 
+        self._drafter_complete_batch(is_validate)
+
         return DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
         )
+
+    def _drafter_training_active(self, is_validate: bool) -> bool:
+        """Whether opportunistic drafter training is live for this rollout."""
+        return bool(
+            not is_validate
+            and self.use_spec
+            and self.drafter_manager is not None
+            and self.config.speculative.train.enable_drafter_training
+        )
+
+    def _drafter_release_after_generation(self, is_validate: bool = False) -> None:
+        """Free the engine's memory and tell the coordinator this worker is idle.
+
+        Multi-turn counterpart of _generate_with_drafter's tail.
+        """
+        if not self._drafter_training_active(is_validate):
+            return
+        loop = _get_or_create_event_loop()
+        current_worker_id = dist.get_rank()
+        try:
+            if self._tp_rank == 0 and self.sharding_manager is not None:
+                loop.run_until_complete(self.sharding_manager.release_memory())
+            torch.cuda.empty_cache()
+            loop.run_until_complete(self.drafter_manager.release_worker_memory(current_worker_id))
+        except Exception as e:  # a drafter-training failure must not kill the rollout
+            logger.warning(f"[drafter] release after generation failed on worker {current_worker_id}: {e}")
+
+    def _drafter_complete_batch(self, is_validate: bool = False) -> None:
+        """Mark this worker done and wait for any training it started to clean up.
+
+        The wait matters: the next rollout needs the memory back, and a worker
+        that starts batch N+1 while still training batch N will fight itself for
+        the GPU.
+        """
+        if not self._drafter_training_active(is_validate):
+            return
+        loop = _get_or_create_event_loop()
+        current_worker_id = dist.get_rank()
+        try:
+            loop.run_until_complete(
+                asyncio.wait_for(self.drafter_manager.mark_worker_completed(current_worker_id), timeout=3.0)
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"[drafter] mark_worker_completed on {current_worker_id}: {e}")
+        try:
+            if not self.drafter_manager._training_cleanup_complete.is_set():
+                start_wait = time.time()
+                done = loop.run_until_complete(
+                    loop.run_in_executor(None, self.drafter_manager._training_cleanup_complete.wait, 10.0)
+                )
+                logger.info(
+                    f"[drafter] worker {current_worker_id} training cleanup "
+                    f"{'completed' if done else 'TIMED OUT'} after {time.time() - start_wait:.2f}s"
+                )
+        except Exception as e:
+            logger.warning(f"[drafter] cleanup wait failed on {current_worker_id}: {e}")
+        # Keep workers in lockstep across batches, as the single-turn path does.
+        dist.barrier()
 
     def _preprocess_prompt_to_async_rollout_requests(self, prompts: DataProto) -> list[AsyncRolloutRequest]:
         assert "raw_prompt" in prompts.non_tensor_batch, (

@@ -1166,10 +1166,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         This is called during the compute_log_prob phase to collect training data for the Eagle drafter model.
         """
         # Only proceed if we have a drafter manager with background trainer
-        if not hasattr(self, "ulysses_sharding_manager") or self.ulysses_sharding_manager is None:
+        # `drafter_module` is set on the ROLLOUT sharding manager
+        # (FSDPSGLangShardingManager), not the Ulysses one -- _build_rollout does
+        # `rollout_sharding_manager.drafter_module = drafter_module_fsdp`.
+        # Reading ulysses_sharding_manager here made this method return early
+        # every time, so the trainer-side collection path silently added nothing
+        # to the drafter's buffer and drafter training could never have data.
+        sharding_mgr = getattr(self, "rollout_sharding_manager", None)
+        if sharding_mgr is None:
             return
-
-        sharding_mgr = self.ulysses_sharding_manager
         if not hasattr(sharding_mgr, "drafter_module") or sharding_mgr.drafter_module is None:
             return
 

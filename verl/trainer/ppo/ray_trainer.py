@@ -1441,6 +1441,19 @@ class RayPPOTrainer:
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
+                # Advance the rollout workers' drafter step counter. This is a
+                # registered RPC that nothing called, so current_rl_step sat at 0
+                # forever and should_collect_data_this_step() -- (step+1) %
+                # interval -- was false for every interval > 1.
+                if (
+                    self.config.get("speculative", {}).get("enable", False)
+                    and self.config.get("speculative", {}).get("train", {}).get("enable_drafter_training", False)
+                ):
+                    try:
+                        self.actor_rollout_wg.increment_rl_step()
+                    except Exception as e:  # instrumentation must not kill a run
+                        logger.warning(f"increment_rl_step failed: {e}")
+
                 progress_bar.update(1)
                 self.global_steps += 1
 

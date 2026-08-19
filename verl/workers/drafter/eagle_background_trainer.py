@@ -469,14 +469,15 @@ class EagleBackgroundTrainer:
             logger.warning("No model available for training")
             return False
 
-        # Skip training if we're not collecting hidden states (since we can't train without them)
-        collect_hidden_states_from_sgl = bool(self.config.get("collect_hidden_states_from_sgl", False))
-        if not collect_hidden_states_from_sgl:
-            logger.debug(
-                f"[EagleTrainer rank {self.rank}] Skipping training step {step} "
-                f"because collect_hidden_states_from_sgl=False"
-            )
-            return False
+        # Gate on whether DATA exists, not on which collector produced it. Hidden
+        # states arrive by two independent routes: the sglang engine
+        # (collect_hidden_states_from_sgl -> collected_data) and the trainer's
+        # own forward pass during old_log_prob (add_drafter_data_to_buffer ->
+        # data_buffer). _prepare_training_batch already reads either and returns
+        # None when there is nothing, so refusing on the sgl flag alone rejected
+        # a perfectly good buffer -- and the sgl collector only runs in the
+        # single-turn rollout path, which is why drafter training was
+        # unreachable in multi-turn.
 
         batch = self._prepare_training_batch()
         if batch is None:
