@@ -20,8 +20,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export VIRTUAL_ENV="${EAGLE_VENV:-$ROOT/.venv}"     # NOT ${VIRTUAL_ENV:-...}
 PY="$VIRTUAL_ENV/bin/python"
 
-echo "==> building venv at $VIRTUAL_ENV"
-uv venv --python 3.10 "$VIRTUAL_ENV"
+if [[ ! -d "$VIRTUAL_ENV" ]]; then
+  echo "==> building venv at $VIRTUAL_ENV"
+  uv venv --python 3.10 "$VIRTUAL_ENV"
+else
+  echo "==> venv already exists at $VIRTUAL_ENV; reusing"
+fi
 
 echo "==> installing pinned requirements"
 VIRTUAL_ENV="$VIRTUAL_ENV" uv pip install --python "$PY" -r "$ROOT/requirements.txt"
@@ -48,13 +52,26 @@ VIRTUAL_ENV="$VIRTUAL_ENV" uv pip install --python "$PY" \
 
 echo "==> verifying (and proving we did NOT touch the other venvs)"
 "$PY" - <<'PYEOF'
-import torch, transformers, deepspeed
+import torch, transformers
 print(f"  torch        {torch.__version__}")
 print(f"  transformers {transformers.__version__}")
-print(f"  deepspeed    {deepspeed.__version__}")
-print(f"  cuda avail   {torch.cuda.is_available()} ({torch.cuda.device_count()} devices)")
+gpu = torch.cuda.is_available()
+print(f"  cuda avail   {gpu} ({torch.cuda.device_count()} devices)")
 assert torch.__version__.startswith("2.6"), "torch must be 2.6.x here"
 assert transformers.__version__.startswith("4.51"), "transformers must be 4.51.x here"
+
+# deepspeed.ops.transformer.inference.triton decorates a kernel with
+# @triton.autotune at import time, which resolves triton's active driver
+# backend eagerly -- on a node with no GPU at all (0 registered backends,
+# not even a CPU one) that raises before printing anything, so this can only
+# be checked on a node that actually has a GPU driver present.
+try:
+    import deepspeed
+    print(f"  deepspeed    {deepspeed.__version__}")
+except Exception as e:
+    if gpu:
+        raise
+    print(f"  deepspeed    SKIPPED (no GPU driver on this node) -- {type(e).__name__}: {e}"[:200])
 PYEOF
 
 echo "==> eagle-train venv ready: $PY"

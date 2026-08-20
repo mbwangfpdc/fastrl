@@ -67,6 +67,7 @@ smoke_test() {
   echo "==> Smoke test"
   "$VIRTUAL_ENV/bin/python" - <<'PY'
 import importlib
+import torch
 mods = ['numpy','scipy','torch','transformers','flash_attn','tvm_ffi','flashinfer',
         'sgl_kernel','sglang','ray','tensordict','sentence_transformers','decord','verl']
 bad = []
@@ -75,13 +76,25 @@ for m in mods:
         importlib.import_module(m)
     except Exception as e:
         bad.append((m, repr(e)[:120]))
-from sglang.srt.entrypoints.engine import Engine                      # noqa: F401
-import sglang.srt.speculative.eagle_worker                            # noqa: F401
-from verl.workers.rollout.sglang_rollout.sglang_rollout import SGLangRollout  # noqa: F401
-import torch
 print('import failures:', bad or 'none')
 print('cuda:', torch.cuda.is_available(), torch.cuda.device_count(),
       torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')
+
+# sgl_kernel's compiled ops dlopen libcuda.so.1 (the NVIDIA driver library) at
+# import time regardless of whether a GPU is actually used, so this and
+# everything downstream of it can only be checked on a node that has a GPU
+# driver present. On a driver-less (e.g. CPU-only build) node, skip rather
+# than fail the whole install over a check the venv itself doesn't need to
+# pass yet -- rerun on a GPU node to get the real signal.
+try:
+    from sglang.srt.entrypoints.engine import Engine                      # noqa: F401
+    import sglang.srt.speculative.eagle_worker                            # noqa: F401
+    from verl.workers.rollout.sglang_rollout.sglang_rollout import SGLangRollout  # noqa: F401
+    print('sglang engine imports: ok')
+except Exception as e:
+    if torch.cuda.is_available():
+        raise
+    print(f'sglang engine imports: SKIPPED (no GPU driver on this node) -- {type(e).__name__}')
 PY
 }
 
