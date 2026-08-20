@@ -11,8 +11,10 @@ interaction:
     class_name: verl.interactions.sql_interaction.SQLInteraction
     config:
       # Root of the text2sql database tree: the directory holding
-      # SynSQL-2.5M/, spider/ and bird/.
-      db_path: /local_nvme1/mborjigi/data/text2sql-data/data
+      # SynSQL-2.5M/, spider/ and bird/. Node-specific -- override with
+      # +actor_rollout_ref.rollout.multi_turn.interaction_config_path=... or
+      # edit in place per node; /local_nvme1/... was this box's predecessor.
+      db_path: /users/mborjigi/data/datasets/skyrl_sql/data
       # Assistant-turn budget when a sample carries no `max_turns` of its own.
       # Keep actor_rollout_ref.rollout.multi_turn.max_assistant_turns strictly
       # greater than this so the env, not verl, decides when an episode ends.
