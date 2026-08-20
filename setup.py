@@ -26,7 +26,10 @@ with open(os.path.join(version_folder, "verl/version/version")) as f:
 install_requires = [
     "accelerate",
     "codetiming",
-    "datasets",
+    # datasets<3.0 still subclasses the removed pa.PyExtensionType (features.py);
+    # unpinned, uv resolves pyarrow>=19 (below) alongside a pre-3.0 datasets and
+    # `import datasets` dies with AttributeError before any training code runs.
+    "datasets>=3.0",
     "dill",
     "hydra-core",
     "numpy<2.0.0",
