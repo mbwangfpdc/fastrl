@@ -363,7 +363,7 @@ class EAGLEWorker(TpModelWorker):
 
             if self.adaptive_spec_consecutive_checks >= self.adaptive_spec_warmup_checks:
                 if not self.adaptive_spec_enabled:
-                    logger.debug(
+                    logger.info(
                         f"[AdaptiveSpec] ENABLING speculation after "
                         f"{self.adaptive_spec_consecutive_checks} checks (batch_size={batch_size}). "
                         f"Will requeue requests for EXTEND. Running this batch as non-SD."
@@ -425,6 +425,35 @@ class EAGLEWorker(TpModelWorker):
                 # Temporarily disable spec to make target worker treat this as normal decode
                 batch.spec_algorithm = SpeculativeAlgorithm.NONE
                 batch.spec_info = None
+
+                # The scheduler's own decode preparation (ScheduleBatch.prepare_for_decode,
+                # called from get_next_batch_to_run -> update_running_batch, BEFORE we get
+                # here) skips its real body -- input_ids left un-collapsed from output_ids,
+                # out_cache_loc never (re)allocated, seq_lens never bumped -- whenever
+                # skip_prepare=True, which is decided from the STATIC, engine-level
+                # spec_algorithm (non-none for the whole life of an EAGLE-configured
+                # engine), not from this per-batch adaptive enable_sd decision. So every
+                # batch adaptively downgraded to non-speculative arrives here with a batch
+                # still shaped like whatever ran last (often a much larger extend/prefill),
+                # and gets fed downstream as if it were a normal `batch_size` decode step.
+                # Confirmed via a live repro: batch_size=20 decode step carrying an
+                # unrelated 2522-3249-token input_ids, crashing in cuda graph replay / the
+                # KV buffer setup with a shape mismatch. Run the real preparation now, since
+                # by this point we know for certain this batch is not going to speculate.
+                # prepare_for_decode's real body does `self.input_ids = self.output_ids`,
+                # trusting ScheduleBatch.output_ids -- but under an EAGLE-configured
+                # engine that batch-level field is never populated via the generic
+                # path either (that per-round "next token" bookkeeping lives in
+                # spec_info instead), so it can be None/stale here too. Rebuild it from
+                # each request's own record, the same source prepare_for_decode's own
+                # penalizer-orchestrator branch above already trusts for this exact
+                # purpose (req.output_ids[-1]).
+                batch.output_ids = torch.tensor(
+                    [req.output_ids[-1] for req in batch.reqs],
+                    dtype=torch.int64,
+                    device=batch.device,
+                )
+                batch.prepare_for_decode(skip_prepare=False)
 
                 model_worker_batch = batch.get_model_worker_batch()
 

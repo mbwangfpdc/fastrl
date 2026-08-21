@@ -285,6 +285,13 @@ class SchedulerMetricsMixin:
         )
 
         logger.info(msg)
+        # logger.info alone is unreliable in this embedded (verl/Ray) integration --
+        # verl's own logging setup leaves the root logger at WARNING and sglang's own
+        # per-process configure_logger() does not appear to run/win here, so INFO-level
+        # messages (including this one, carrying spec_accept_length/spec_accept_rate --
+        # the actual signal for whether speculative decoding is paying off) are silently
+        # dropped. print() bypasses that entirely.
+        print(msg, flush=True)
         if self.enable_metrics:
             # Basics
             self.stats.num_running_reqs = num_running_reqs
