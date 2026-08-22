@@ -102,4 +102,11 @@ class FSDPEngineConfig(BaseConfig):
     fsdp_size: int = -1
     forward_prefetch: bool = False
     model_dtype: str = "fp32"
+    # FSDP MixedPrecision {param_dtype, reduce_dtype, buffer_dtype}. fsdp_workers
+    # already reads this via fsdp_config.get("mixed_precision"), defaulting to
+    # param bf16 / reduce fp32 when absent — but the field was missing from the
+    # dataclass, so setting it from the CLI raised an unexpected-keyword
+    # TypeError at instantiation. Needed to reduce gradients in bf16, which is
+    # what granular-cais-rl does (reduce_dtype = bfloat16).
+    mixed_precision: Optional[dict[str, Any]] = None
     use_orig_params: bool = False

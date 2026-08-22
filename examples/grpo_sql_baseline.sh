@@ -44,6 +44,23 @@ export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export PATH="$CUDA_HOME/bin:$PATH"
 
 export TOKENIZERS_PARALLELISM=true
+
+# Root of the text2sql database tree, consumed by examples/sql/interaction_config.yaml
+# via ${oc.env:SKYRL_SQL_DB_PATH}. Node-specific, so pick the first known root that
+# actually exists here rather than hardcoding one machine's layout in the config.
+if [ -z "${SKYRL_SQL_DB_PATH:-}" ]; then
+  for _cand in /local_nvme1/mborjigi/data/text2sql-data/data \
+               /users/mborjigi/data/datasets/skyrl_sql/data \
+               /oscar/scratch/mborjigi/data/text2sql-data/data; do
+    if [ -d "$_cand" ]; then SKYRL_SQL_DB_PATH="$_cand"; break; fi
+  done
+fi
+if [ -z "${SKYRL_SQL_DB_PATH:-}" ]; then
+  echo "ERROR: no text2sql database root found. Set SKYRL_SQL_DB_PATH=<dir holding spider/, bird/, SynSQL-2.5M/>." >&2
+  exit 1
+fi
+export SKYRL_SQL_DB_PATH
+echo "==> SKYRL_SQL_DB_PATH: $SKYRL_SQL_DB_PATH"
 export NCCL_DEBUG=WARN
 export MKL_SERVICE_FORCE_INTEL=1
 export HF_HOME=${HF_HOME:-/local_nvme0/mborjigi/hf}

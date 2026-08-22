@@ -11,10 +11,13 @@ interaction:
     class_name: verl.interactions.sql_interaction.SQLInteraction
     config:
       # Root of the text2sql database tree: the directory holding
-      # SynSQL-2.5M/, spider/ and bird/. Node-specific -- override with
-      # +actor_rollout_ref.rollout.multi_turn.interaction_config_path=... or
-      # edit in place per node; /local_nvme1/... was this box's predecessor.
-      db_path: /users/mborjigi/data/datasets/skyrl_sql/data
+      # SynSQL-2.5M/, spider/ and bird/. This is node-specific, so it is read
+      # from the environment rather than hardcoded -- grpo_sql_baseline.sh
+      # exports SKYRL_SQL_DB_PATH, picking the first known root that exists on
+      # this machine. Hardcoding it here meant the file had to be edited on
+      # every migration, and a stale path fails deep in a rollout as
+      # "Database file not found", long after the run looks healthy.
+      db_path: ${oc.env:SKYRL_SQL_DB_PATH}
       # Assistant-turn budget when a sample carries no `max_turns` of its own.
       # Keep actor_rollout_ref.rollout.multi_turn.max_assistant_turns strictly
       # greater than this so the env, not verl, decides when an episode ends.
