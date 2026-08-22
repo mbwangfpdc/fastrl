@@ -13,7 +13,11 @@
 #   entropy_coef 0.0                            -> actor.entropy_coeff
 #   batch 256 / mini 256 / num_generations 5    -> train_batch_size / ppo_mini_batch_size / rollout.n
 #   temp .6 / top_p .95 / top_k -1              -> rollout.temperature / top_p / top_k
-#   max_prompt_len 4096 / max_input_length 8192 -> max_prompt_length 4096 / max_response_length 4096
+#   max_prompt_len 4096                         -> data.max_prompt_length 4096
+#   max_generate_length 3000                    -> data.max_response_length (PER-TURN cap)
+#   max_input_length 8192                       -> rollout.max_model_len (trajectory envelope)
+#   drop_zero_signal true                       -> algorithm.drop_zero_signal
+#   reduce_dtype bfloat16                       -> fsdp_config.mixed_precision.reduce_dtype
 #   max_turns 5                                 -> env max_turns, verl max_assistant_turns 6
 #   end_tags ["</sql>","</solution>"]           -> rollout.stop  (+ no_stop_trim)
 #   use_conversation_multi_turn false           -> multi_turn.use_conversation_multi_turn=False
@@ -84,8 +88,18 @@ n_resp_per_prompt=${N_RESP:-5}
 max_steps=${MAX_STEPS:-35}
 
 max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
-max_response_length=${MAX_RESPONSE_LENGTH:-4096}
-max_model_len=$((max_prompt_length + max_response_length))
+# PER-TURN generation cap, matching granular's max_generate_length. In verl
+# multi-turn this bounds each engine call, NOT the trajectory: measured on a
+# 3150-trajectory trace with this at 3000, max single-turn decode was exactly
+# 3000 while max TOTAL decode reached 4764 (verl only warns past it). The old
+# default of 4096 came from mapping granular's max_input_length here, which
+# conflated the envelope with the per-turn cap and handed FastRL 36% more
+# generation budget per turn.
+max_response_length=${MAX_RESPONSE_LENGTH:-3000}
+# Trajectory envelope, matching granular's max_input_length. Set independently
+# rather than as prompt+response: granular reproduced SkyRL's results at 8192,
+# and coupling it to the (now smaller) per-turn cap would shrink it to 7096.
+max_model_len=${MAX_MODEL_LEN:-8192}
 # sql_baseline.toml uses 24000, but that is granular's packing envelope. verl
 # materialises full (T x 152k) logits per microbatch and upcasts for log-softmax,
 # so 24000 OOMs a 44GB card. Lowering it only changes microbatch splitting
@@ -163,6 +177,8 @@ sleep 3
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${ulysses} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${ulysses} \
     actor_rollout_ref.model.enable_gradient_checkpointing=${grad_ckpt} \
+    +actor_rollout_ref.actor.fsdp_config.mixed_precision.param_dtype=bf16 \
+    +actor_rollout_ref.actor.fsdp_config.mixed_precision.reduce_dtype=bf16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=${param_offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${optim_offload} \
     actor_rollout_ref.actor.fsdp_config.reshard_after_forward=${reshard_after_fwd} \
@@ -191,6 +207,7 @@ sleep 3
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${max_assistant_turns} \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=${max_assistant_turns} \
     algorithm.adv_estimator=grpo \
+    algorithm.drop_zero_signal=${DROP_ZERO_SIGNAL:-True} \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger="['console']" \

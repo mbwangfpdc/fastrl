@@ -404,6 +404,13 @@ algorithm:
   lam: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
+  # Drop GRPO groups whose rollouts all scored identically: their advantages are
+  # exactly zero, so they contribute no gradient, but with loss_agg_mode
+  # token-mean their tokens still enter the denominator and dilute the update --
+  # and they still cost a full old_log_prob forward and an update_actor pass.
+  # granular-cais-rl drops them at group assembly (drop_zero_signal); measured
+  # there at ~25% of groups on this workload.
+  drop_zero_signal: false
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:

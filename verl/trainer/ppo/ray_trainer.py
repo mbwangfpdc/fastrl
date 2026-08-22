@@ -295,6 +295,54 @@ def compute_advantage(
     return data
 
 
+
+def filter_zero_signal_groups(batch, reward_tensor, num_generations: int):
+    """Drop GRPO groups whose rollouts all scored identically.
+
+    Such a group has every advantage exactly zero -- (r - mean) = 0 for all its
+    members -- so it contributes no gradient. Keeping it is not free, though:
+    under `loss_agg_mode: token-mean` its tokens still land in the denominator
+    and dilute the update, and it still costs a full old_log_prob forward and an
+    update_actor pass. granular-cais-rl drops these at group assembly
+    (`drop_zero_signal`), measured at roughly a quarter of groups on the
+    SkyRL-SQL workload, so leaving them in is both a gradient-scale and a
+    throughput difference between the two systems.
+
+    Called BEFORE old_log_prob so the dropped rollouts cost neither forward nor
+    backward, which is what granular does. Zero-signal is detected as
+    max == min rather than std == 0: exact, and independent of the estimator.
+
+    Returns (batch, reward_tensor, n_groups_dropped, n_samples_dropped).
+    n_groups_dropped == -1 means EVERY group was zero-signal and the caller
+    should skip the step -- there is nothing to learn from.
+    """
+    uids = batch.non_tensor_batch.get("uid")
+    if uids is None:
+        return batch, reward_tensor, 0, 0
+
+    seq_scores = reward_tensor.sum(-1).detach().float().cpu().numpy()
+    by_uid: dict = {}
+    for i, u in enumerate(uids):
+        by_uid.setdefault(u, []).append(i)
+
+    keep, dropped_groups = [], 0
+    for idxs in by_uid.values():
+        vals = seq_scores[idxs]
+        if float(vals.max()) != float(vals.min()):
+            keep.extend(idxs)
+        else:
+            dropped_groups += 1
+
+    if not keep:
+        return batch, reward_tensor, -1, len(seq_scores)
+    if dropped_groups == 0:
+        return batch, reward_tensor, 0, 0
+
+    keep.sort()
+    n_dropped = len(seq_scores) - len(keep)
+    return batch.select_idxs(keep), reward_tensor[keep], dropped_groups, n_dropped
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -1229,6 +1277,29 @@ class RayPPOTrainer:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+
+                    # Drop zero-signal groups before any training-side compute, matching
+                    # granular's drop_zero_signal. Placed here rather than after
+                    # compute_advantage so the dropped rollouts cost neither the
+                    # old_log_prob forward nor update_actor.
+                    if self.config.algorithm.get("drop_zero_signal", False):
+                        batch, reward_tensor, n_grp, n_smp = filter_zero_signal_groups(
+                            batch, reward_tensor, self.config.actor_rollout_ref.rollout.n
+                        )
+                        if n_grp == -1:
+                            print(
+                                f"[drop_zero_signal] step {self.global_steps}: every group was "
+                                f"zero-signal ({n_smp} samples); skipping the update.",
+                                flush=True,
+                            )
+                            progress_bar.update(1)
+                            self.global_steps += 1
+                            if is_last_step:
+                                progress_bar.close()
+                                return
+                            continue
+                        metrics["train/zero_signal_groups_dropped"] = n_grp
+                        metrics["train/zero_signal_samples_dropped"] = n_smp
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
