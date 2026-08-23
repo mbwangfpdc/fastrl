@@ -296,7 +296,7 @@ def compute_advantage(
 
 
 
-def filter_zero_signal_groups(batch, reward_tensor, num_generations: int):
+def filter_zero_signal_groups(batch, reward_tensor, num_generations: int, align: int = 1):
     """Drop GRPO groups whose rollouts all scored identically.
 
     Such a group has every advantage exactly zero -- (r - mean) = 0 for all its
@@ -311,6 +311,12 @@ def filter_zero_signal_groups(batch, reward_tensor, num_generations: int):
     Called BEFORE old_log_prob so the dropped rollouts cost neither forward nor
     backward, which is what granular does. Zero-signal is detected as
     max == min rather than std == 0: exact, and independent of the estimator.
+
+    `align` keeps the surviving count divisible by the data-parallel degree.
+    DataProto.chunk() requires equal chunks, so an arbitrary survivor count
+    aborts the step with "only support equal chunk. Got size of DataProto 135
+    and chunk 2". Whole GROUPS are trimmed to reach alignment, never individual
+    rollouts -- splitting a group would corrupt its advantage baseline.
 
     Returns (batch, reward_tensor, n_groups_dropped, n_samples_dropped).
     n_groups_dropped == -1 means EVERY group was zero-signal and the caller
@@ -335,6 +341,18 @@ def filter_zero_signal_groups(batch, reward_tensor, num_generations: int):
 
     if not keep:
         return batch, reward_tensor, -1, len(seq_scores)
+
+    # Trim whole surviving groups until the count divides the DP degree.
+    if align > 1 and len(keep) % align != 0:
+        survivors = [idxs for idxs in by_uid.values() if idxs and idxs[0] in set(keep)]
+        survivors.sort(key=lambda ix: ix[0])
+        while survivors and len(keep) % align != 0:
+            victim = set(survivors.pop())
+            keep = [i for i in keep if i not in victim]
+            dropped_groups += 1
+        if not keep:
+            return batch, reward_tensor, -1, len(seq_scores)
+
     if dropped_groups == 0:
         return batch, reward_tensor, 0, 0
 
@@ -1238,6 +1256,38 @@ class RayPPOTrainer:
                     # wake + weight sync (`reshard`), so `generate_sequences` is
                     # the inference number and `gen` is not.
                     if _ROLLOUT_ONLY:
+                        # Dump trajectory text here too. The normal dump lives after
+                        # update_actor, so rollout-only would otherwise produce only
+                        # the size/timing trace and no text to actually read.
+                        _dump_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if _dump_dir:
+                            import json as _json
+                            import os as _os
+
+                            _os.makedirs(_dump_dir, exist_ok=True)
+                            _inp = self.tokenizer.batch_decode(
+                                batch.batch["prompts"], skip_special_tokens=True
+                            )
+                            _out = self.tokenizer.batch_decode(
+                                batch.batch["responses"], skip_special_tokens=True
+                            )
+                            _rid = batch.non_tensor_batch.get("request_id")
+                            _path = _os.path.join(_dump_dir, f"step{self.global_steps}.jsonl")
+                            with open(_path, "w") as _fh:
+                                for _i, (_p, _o) in enumerate(zip(_inp, _out)):
+                                    _fh.write(
+                                        _json.dumps(
+                                            {
+                                                "i": _i,
+                                                "request_id": (str(_rid[_i]) if _rid is not None else None),
+                                                "prompt": _p,
+                                                "response": _o,
+                                            }
+                                        )
+                                        + "\n"
+                                    )
+                            print(f"[rollout-only] wrote {len(_inp)} trajectories -> {_path}", flush=True)
+
                         _gs = timing_raw.get("generate_sequences")
                         pprint(
                             f"[rollout-only] step={self.global_steps} "
@@ -1284,7 +1334,10 @@ class RayPPOTrainer:
                     # old_log_prob forward nor update_actor.
                     if self.config.algorithm.get("drop_zero_signal", False):
                         batch, reward_tensor, n_grp, n_smp = filter_zero_signal_groups(
-                            batch, reward_tensor, self.config.actor_rollout_ref.rollout.n
+                            batch,
+                            reward_tensor,
+                            self.config.actor_rollout_ref.rollout.n,
+                            align=self.resource_pool_manager.get_n_gpus(),
                         )
                         if n_grp == -1:
                             print(
