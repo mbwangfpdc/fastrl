@@ -12,14 +12,17 @@ modifications are ours and are not intended for upstream. `origin` is
 
 ## Active work / handoff
 
-**[RESUME_TLT_DRAFTER.md](RESUME_TLT_DRAFTER.md) — read this first.** What is
-done (the sglang-vs-vLLM engine A/B: vLLM ~7% faster on a bit-identical
-workload, so the 2.6x system gap is framework not engine), what is half-finished
-(four fixes making TLT's opportunistic drafter training reachable — one
-confirmed, three unvalidated), the blocker (FastRL's speculative decoding
-crashes on the multi-turn path whenever speculation actually engages), the exact
-resume command, and how to move the trained drafter between nodes without a ~2h
-retrain.
+**[RESUME_TLT_DRAFTER.md](RESUME_TLT_DRAFTER.md) — read this first**, starting
+at `## STATUS 2026-08-25`, which supersedes several older sections of that file.
+
+Short version: the SD-off 35-step e2e run **completed** (reward -0.168 -> 0.562;
+merged HF checkpoint on pistachio); the old multi-turn SD crash is **fixed**
+(`0f7c378`); drafter training has now been **observed running end-to-end** in
+multi-turn. The live blocker is that with the paper's own matched
+target+drafter pair, speculation accepts **nothing** (`accept len 1.00` on every
+decode batch), making SD pure overhead — ranked hypotheses and the non-RL
+control that discriminates between them are in that file. Work is moving to
+Slurm: `scripts/run_tlt_flagship_slurm.sh` (run with `SMOKE=1` first).
 
 ## Running it
 

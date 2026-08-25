@@ -17,7 +17,157 @@ exist on this machine; the essentials are inlined.
 node. Read with [[project_engine_ab_sglang_vs_vllm]] and
 [[project_fastrl_fair_baseline]].
 
-## Where this stands
+**UPDATED 2026-08-25** — moving to Slurm (Oscar) because the pistachio GPUs are
+contended. Read `## STATUS 2026-08-25` next; it supersedes several claims below,
+including the section still titled "THE BLOCKER".
+
+---
+
+## STATUS 2026-08-25 — read this before the older sections
+
+### Done since the last update
+
+**1. The SD-off 35-step e2e run COMPLETED.** This is the reference point for
+everything else. Target `Qwen2.5-Coder-7B-Instruct`, `SPECULATIVE=false`,
+4xL40S, 256x5.
+
+* reward `critic/score/mean` **-0.168 (step 1) -> 0.562 (step 35)**, crossing
+  positive at step 4, plateauing ~0.5-0.6 from step ~14. It learns.
+* step time fell 1150s -> ~460s as responses shortened (mean response length
+  755 -> 471 tok) and zero-signal filtering bit harder (step 35 dropped 188
+  groups / 940 samples).
+* FSDP checkpoint `output/fastrl_sql/FastRL-SQL/e2e35/global_step_35/`, merged
+  to HF at `output/e2e35_merged_hf/` via
+  `python -m verl.model_merger merge --backend fsdp --local_dir <ckpt>/actor
+  --target_dir <out>`. Both live on pistachio only, NOT in git (15 GB / 86 GB).
+* the one `Traceback` in that log is a torch DataLoader `__del__` teardown
+  warning after training finished. Cosmetic.
+* the config that produced it is in `examples/sql/TRAIN_CONFIG_TUNING.md`
+  (commit `b0f583e`): SP2 + `forward_prefetch=True` + `TOKEN_BUDGET=4096` +
+  `GPU_MEM_UTIL=0.6`. SP2 beat SP1 by 17% and SP4 by 26% — the earlier
+  "ulysses SP2 is overly slow" hunch was wrong.
+* `'Final validation metrics: None'` at the end — the end-of-run eval produced
+  nothing. Unexplained, low priority, but do not quote a val number from it.
+
+**2. THE OLD BLOCKER IS FIXED.** The section below titled "THE BLOCKER:
+FastRL's SD crashes on multi-turn" is **stale**. Commit `0f7c378` fixed it
+(`prepare_for_decode`'s `skip_prepare` keyed off the static engine-level
+`spec_algorithm` rather than the per-batch adaptive decision, so batches the
+adaptive gate downgraded arrived unprepared). Confirmed 2026-08-25: ~30 min of
+multi-turn SQL rollout with speculation actively engaging, `enforce_eager=true`,
+**zero tracebacks**. The `BS_THRESHOLD=1` side-step is no longer necessary.
+
+**3. Drafter training now observed running end-to-end in multi-turn.** The
+older note says only fix #2 was confirmed. A 2026-08-25 run logged the whole
+handshake *and* the training side:
+
+```
+Worker 3 (DP=3) released all TP ranks
+Starting training: DP ranks [3], process ranks [3] (1 total)
+[EagleTrainer rank 3] activate_training_model enter training_ranks=[3]
+Training worker 3 completed, broadcasting STOP_TRAINING ...
+All workers completed, broadcasting BATCH_COMPLETE
+```
+
+That exercises #1 (the buffer had data to train on), #2 (handshake), #3 (the
+trainer no longer refuses) and #4 (the step counter advanced far enough to fire
+at interval 10). **Do not overclaim:** this proves the machinery *runs*. It does
+NOT prove the gradient improved the drafter — acceptance never moved (below).
+
+### The mismatch that was wrong all along
+
+`examples/grpo_sql_baseline.sh` defaulted `MODEL_PATH` to
+`Qwen/Qwen2.5-Coder-7B-Instruct` while `SPEC_MODEL_PATH` defaulted to
+`mit-han-lab/Qwen2.5-7B-Eagle-RL` — **an EAGLE drafter whose frozen embedding
+and LM head are tied to base `Qwen/Qwen2.5-7B`, a different model.** Every
+earlier SD measurement on the SQL workload used this invalid pair, which is the
+likely explanation for the old "SD is 1.8x SLOWER" result
+([[project_fastrl_sql_gpu_validation]]). The paper's own pair is in
+`examples/grpo_7B.sh`: target `Qwen/Qwen2.5-7B`, drafter
+`mit-han-lab/Qwen2.5-7B-Eagle-RL`. Both are cached on pistachio under
+`/local_nvme0/mborjigi/hf`.
+
+### THE CURRENT BLOCKER: matched pair, and speculation still contributes nothing
+
+Ran the full flagship config (paper's matched pair, Adaptive Drafter + Adaptive
+Rollout Engine both on, `ENFORCE_EAGER=true`, 16x4, `GPU_MEM_UTIL=0.5`):
+
+* **`accept len: 1.00, accept rate: 0.11` on every single decode batch.**
+  accept len 1.00 means the target's own bonus token and nothing else — zero
+  drafted tokens ever accepted, i.e. SD is pure overhead.
+* consequently slow: ~170 tok/s at bs=16 falling to 15-47 tok/s on the tail. The
+  2-step 16x4 smoke **timed out at 1800s (rc=124) without finishing step 2**,
+  where the SD-off run does full 256x5 steps in ~460s.
+* no crash, no OOM, no traceback. A performance/correctness dead end, not an
+  instability.
+
+A flat, exact 1.00 on every batch is the signature of "no draft token is ever
+accepted", which even a badly distribution-mismatched drafter should beat. So
+**suspect plumbing before suspecting drafter quality.** Ranked hypotheses, none
+yet tested:
+
+1. **RL weight sync desyncs the drafter.** The target's weights are pushed to
+   the engine every step; if the drafter's frozen embed/LM-head references are
+   not re-tied (or are re-tied to the *updated* target while the drafter body is
+   stale) acceptance would collapse to zero. Highest prior, because it is
+   specific to the RL setting — which is exactly what is unusual here versus
+   every static-inference EAGLE deployment.
+2. **Sampling params.** Ours is `temperature=0.6, top_p=0.95` (matching
+   granular); the paper used `temperature=0.9`. Cheap to test, unlikely to
+   explain an exact 1.00.
+3. **`enforce_eager` degeneracy in tree verification.** SD provably does not
+   *crash* without CUDA graphs, but the verify path is far less exercised there.
+   Test by flipping `ENFORCE_EAGER=false` purely as a diagnostic — if acceptance
+   jumps, then "CUDA graphs off" and TLT's flagship feature are in direct
+   conflict, which is itself a finding worth reporting.
+4. **Distribution mismatch.** The drafter targets the paper's post-RL math/code
+   model; ours is multi-turn SQL. Real, but should degrade acceptance, not zero it.
+
+Diagnose with a **non-RL control first** — it separates hypothesis 1 from the
+rest in one shot: run `scripts/bench_speculative_decoding.py` (or plain sglang)
+with that target+drafter pair and no training loop. Healthy acceptance there and
+1.00 inside RL means it is the weight sync.
+
+### The tension nobody has resolved yet
+
+Matching the paper means `Qwen/Qwen2.5-7B`, a **base** model. Our SQL pipeline
+feeds a chat template and the SkyRL-SQL recipe normally starts from an
+instruct/coder checkpoint — the completed 35-step run above used
+`Qwen2.5-Coder-7B-Instruct` and learned well. Base-model rollouts on this
+workload may simply be poor, confounding any speed comparison with a quality
+difference. Decide explicitly which is held fixed:
+
+* **paper fidelity** -> `Qwen2.5-7B` + their drafter, accepting that reward
+  quality may be far worse than the 0.56 reference.
+* **workload fidelity** -> `Qwen2.5-Coder-7B-Instruct`, and then a matching
+  drafter must be TRAINED for it (`eagle-train/`, ~2h) because the published one
+  does not apply. More honest for our paper, but costs a drafter-training cycle.
+
+### How to resume on Slurm
+
+`scripts/run_tlt_flagship_slurm.sh` is the flagship job, written for Oscar and
+matching `run_35step_train_slurm.sh`'s conventions (nproc ulimit, Lmod CUDA,
+`RAY_OVERRIDE_RESOURCES`). Smoke first, always:
+
+```bash
+sbatch --export=ALL,SMOKE=1 scripts/run_tlt_flagship_slurm.sh   # 2 steps, 16x4
+sbatch scripts/run_tlt_flagship_slurm.sh                        # 35 steps, 256x5
+```
+
+The smoke variant exists precisely because the full-feature config timed out at
+that scale on pistachio — **treat "completes 2 steps" as the gate** for the
+20-hour job. Triage commands are in the script's footer; the first thing to look
+at is `grep -o 'accept len: [0-9.]*'`. If it is still 1.00, do not bother reading
+the timings: fix acceptance first, because a speed number for a drafter that
+accepts nothing measures nothing about TLT.
+
+`Qwen/Qwen2.5-7B` (15 GB) and `mit-han-lab/Qwen2.5-7B-Eagle-RL` (1.5 GB) are
+cached on pistachio at `/local_nvme0/mborjigi/hf`; on Oscar they re-download to
+`$HF_HOME` unless copied over.
+
+---
+
+## Where this stands (2026-08-19 — see STATUS above for what has changed since)
 
 **DONE:** engine A/B — vLLM ~7% faster than sglang on a bit-identical workload,
 so the 2.6x system gap is framework not engine. Fully written up; no further
@@ -57,7 +207,13 @@ still unverified (need a completed step: buffer adds + an executed training step
 only on exception, so success is silent (`[drafter]` count was 0 despite
 working). Add an info log on the success path or resuming will be confusing.
 
-## THE BLOCKER: FastRL's SD crashes on multi-turn when speculation engages
+## ~~THE BLOCKER~~: FastRL's SD crashes on multi-turn when speculation engages
+
+> **STALE as of 2026-08-25 — FIXED by commit `0f7c378`.** Kept for the
+> diagnosis trail only. Multi-turn SD now runs for 30+ min with
+> `enforce_eager=true` and zero tracebacks; `BS_THRESHOLD=1` is no longer
+> needed to side-step it. The live blocker is zero draft acceptance — see
+> `## STATUS 2026-08-25`.
 
 Reproduced 3x, **with drafter training OFF** (so independent of the 4 fixes):
 * CUDA graphs on -> `size of tensor a (20) must match tensor b (2635)` — the
@@ -78,7 +234,15 @@ engages immediately, and it dies. If true, **restate the old conclusion**: not
 does run on multi-turn." Old logs lack decode stats — confirm by logging
 accept_length or the "Speculative decoding will be disabled" message.
 
-## How to resume
+## How to resume (2026-08-19 version — superseded)
+
+> **Superseded 2026-08-25.** Both goals of this recipe are now met: the SD
+> multi-turn crash is fixed (`0f7c378`) and drafter training has been observed
+> running end-to-end, so `BS_THRESHOLD=1` is no longer needed. Use
+> `### How to resume on Slurm` in `## STATUS 2026-08-25` instead. Kept because
+> the checks it lists are still the right ones for verifying the 4 fixes, and
+> the pistachio-local drafter path here is still the only trained
+> Coder-Instruct-matched drafter that exists.
 
 Validate the plumbing while side-stepping the SD bug: **`BS_THRESHOLD=1`** keeps
 `use_spec` true (drafter + optimizer built, handshake armed) while the gate keeps
