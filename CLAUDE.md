@@ -17,12 +17,16 @@ at `## STATUS 2026-08-25`, which supersedes several older sections of that file.
 
 Short version: the SD-off 35-step e2e run **completed** (reward -0.168 -> 0.562;
 merged HF checkpoint on pistachio); the old multi-turn SD crash is **fixed**
-(`0f7c378`); drafter training has now been **observed running end-to-end** in
-multi-turn. The live blocker is that with the paper's own matched
-target+drafter pair, speculation accepts **nothing** (`accept len 1.00` on every
-decode batch), making SD pure overhead — ranked hypotheses and the non-RL
-control that discriminates between them are in that file. Work is moving to
-Slurm: `scripts/run_tlt_flagship_slurm.sh` (run with `SMOKE=1` first).
+(`0f7c378`). On Oscar: with the paper's matched target+drafter pair and
+Adaptive Drafter training OFF, the Adaptive Rollout Engine gets **real
+acceptance (2.05-8.50)** — the old "accept len 1.00 / SD is pure overhead"
+result was the wrong-drafter artifact, not a real limitation
+(`run_tlt_flagship_norafter_slurm.sh`, job 5242734). With Adaptive Drafter
+training also on, the same smoke config instead **hangs the whole node**
+(job 5197256: 12h+ at 0% GPU util, node process table exhausted) — worse than
+the earlier "contributes nothing" verdict, and still unresolved. See
+`RESUME_TLT_DRAFTER.md`'s `### UPDATE 2026-08-25 (Oscar)` for the full
+writeup and next steps.
 
 ## Running it
 

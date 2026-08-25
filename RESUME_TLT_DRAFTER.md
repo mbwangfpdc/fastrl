@@ -21,6 +21,12 @@ node. Read with [[project_engine_ab_sglang_vs_vllm]] and
 contended. Read `## STATUS 2026-08-25` next; it supersedes several claims below,
 including the section still titled "THE BLOCKER".
 
+**UPDATED 2026-08-25 (later, on Oscar)** — ran the flagship config there. Read
+`### UPDATE 2026-08-25 (Oscar)` inside the STATUS section first: Adaptive
+Rollout Engine alone gets real acceptance (2.05-8.50) with the matched pair;
+Adaptive Drafter training now hangs the whole node instead of just
+underperforming.
+
 ---
 
 ## STATUS 2026-08-25 — read this before the older sections
@@ -87,7 +93,56 @@ likely explanation for the old "SD is 1.8x SLOWER" result
 `mit-han-lab/Qwen2.5-7B-Eagle-RL`. Both are cached on pistachio under
 `/local_nvme0/mborjigi/hf`.
 
-### THE CURRENT BLOCKER: matched pair, and speculation still contributes nothing
+### UPDATE 2026-08-25 (Oscar): Adaptive Rollout Engine alone DOES get real acceptance -- Adaptive Drafter training is what's actually broken
+
+Two runs on Oscar (`scripts/run_tlt_flagship_slurm.sh` and its new sibling
+`run_tlt_flagship_norafter_slurm.sh`), same matched pair, same smoke scale
+(16x4, 2 steps), one knob different:
+
+1. **Both features on** (job 5197256, `run_tlt_flagship_slurm.sh`): hung
+   completely ~8min into step 1, right after the Adaptive Drafter's background
+   training handshake finished (`Worker 0 cleaning up training`), immediately
+   followed by a print never seen in any prior run here: `torch_memory_saver:
+   Cannot pause allocation that is not active. tag=kv_cache`. GPU util on all 4
+   GPUs dropped to 0% and stayed there for 12h+ with zero further log output;
+   the node's process/thread table for the job's cgroup was fully exhausted
+   (every `srun --overlap` exec failed to fork -- a real leak, not a plain
+   deadlock). This is WORSE than the pistachio result recorded just below
+   (which at least logged repeated `accept len: 1.00` readings before its
+   1800s external timeout fired) -- that run may itself have been silently
+   heading toward the same hang and simply gotten killed first. Root cause not
+   confirmed: live diagnosis was blocked because the fork table was already
+   exhausted by the time this was investigated. Best guess, unconfirmed: a
+   state-tracking race between the Adaptive Drafter's background-training
+   reentry and the per-round KV-cache pause/resume bookkeeping in
+   `fsdp_sglang.py`'s `sleep()`/`wake_up()` -- the same general class of bug as
+   the already-fixed `0f7c378` crash (adaptive per-batch/subsystem state vs.
+   static engine-level state), just in the memory-saver path instead of
+   `prepare_for_decode`.
+
+2. **Adaptive Rollout Engine only** (job 5242734, `DRAFTER_TRAINING=false
+   DRAFTER_COLLECT_SGL=false`, everything else identical): completed cleanly,
+   rc=0, 8m18s, both steps. **Accept len ranged 2.05-8.50 across decode
+   batches** -- not the flat 1.00 below. This confirms the leading hypothesis
+   in the (now-partly-stale) section right below: **the old "SD 1.8x slower" /
+   accept-len-1.00 result was an artifact of the wrong drafter pairing, not a
+   fundamental limitation of the paper's Adaptive Rollout Engine or of pairing
+   SD with a base `Qwen2.5-7B` target.** Reward moved -0.167 -> -0.071 over the
+   2 steps (expected for a cold base model at 2 steps, nothing to read into
+   it). Gen time was 91s (step 1) / 49s (step 2) for 16x4 -- no sign of the
+   15-47 tok/s tail collapse seen in the run below.
+
+**So: Adaptive Rollout Engine (matched pair) works. Adaptive Drafter training
+is the actual open blocker**, and now looks like a real bug (resource leak on
+Oscar) rather than only a "contributes nothing" performance dead end. The
+non-RL control suggested below (`scripts/bench_speculative_decoding.py`, no
+training loop) is still the right next step for isolating whether even THAT
+subsystem's underlying weight-sync path is sound, but do it with
+`DRAFTER_TRAINING` specifically in scope now, not general SD.
+
+---
+
+### THE CURRENT BLOCKER (pistachio, 2026-08-25, superseded by the Oscar runs above for the "does SD itself work" question): matched pair, and speculation still contributes nothing
 
 Ran the full flagship config (paper's matched pair, Adaptive Drafter + Adaptive
 Rollout Engine both on, `ENFORCE_EAGER=true`, 16x4, `GPU_MEM_UTIL=0.5`):
