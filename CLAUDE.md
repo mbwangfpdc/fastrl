@@ -17,16 +17,24 @@ at `## STATUS 2026-08-25`, which supersedes several older sections of that file.
 
 Short version: the SD-off 35-step e2e run **completed** (reward -0.168 -> 0.562;
 merged HF checkpoint on pistachio); the old multi-turn SD crash is **fixed**
-(`0f7c378`). On Oscar: with the paper's matched target+drafter pair and
-Adaptive Drafter training OFF, the Adaptive Rollout Engine gets **real
-acceptance (2.05-8.50)** — the old "accept len 1.00 / SD is pure overhead"
-result was the wrong-drafter artifact, not a real limitation
-(`run_tlt_flagship_norafter_slurm.sh`, job 5242734). With Adaptive Drafter
-training also on, the same smoke config instead **hangs the whole node**
-(job 5197256: 12h+ at 0% GPU util, node process table exhausted) — worse than
-the earlier "contributes nothing" verdict, and still unresolved. See
-`RESUME_TLT_DRAFTER.md`'s `### UPDATE 2026-08-25 (Oscar)` for the full
-writeup and next steps.
+(`0f7c378`). With the paper's matched target+drafter pair and Adaptive
+Drafter training OFF, the Adaptive Rollout Engine gets **real acceptance**
+(2.05-8.50 at smoke scale) — the old "accept len 1.00 / SD is pure overhead"
+result was the wrong-drafter artifact, not a real limitation. A full clean
+10-step production-batch (256x5) run **completed 2026-08-26** after fixing
+three bugs (an EAGLE buffer sized off the model's unused 128K native context
+instead of the actual 8K working ceiling; a related SD admission-check
+margin; a wrong Hydra path for the NCCL collective timeout) — see
+`sglang_rollout.py`'s `AsyncEngine(...)` call site and
+`scripts/run_tlt_norafter_prod_slurm.sh`'s header for the fixes. Result:
+**reward stayed flat (-0.75 to -0.80) across all 10 steps** and **252/256
+GRPO groups were dropped as zero-signal every step** — the paper's base
+(non-instruct) `Qwen2.5-7B` basically doesn't learn on this SQL workload in
+this window, unlike the Coder-Instruct target used elsewhere in this
+comparison. With Adaptive Drafter training also on, the flagship smoke config
+still **hangs the whole node** (job 5197256: 12h+ at 0% GPU util, node
+process table exhausted) — unresolved, not yet revisited. See
+`RESUME_TLT_DRAFTER.md`'s `### UPDATE 2026-08-26` for the full writeup.
 
 ## Running it
 

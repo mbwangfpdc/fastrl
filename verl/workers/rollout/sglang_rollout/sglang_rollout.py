@@ -485,6 +485,40 @@ class SGLangRollout(BaseRollout):
                 model_path=actor_module,
                 dtype=self.config.dtype,
                 mem_fraction_static=self.config.gpu_memory_utilization,
+                # Without this, sglang's ModelConfig falls back to the model's
+                # own native max_position_embeddings (131072 for Qwen2.5-7B)
+                # instead of our actual working ceiling. That uncapped value
+                # flows into the EAGLE draft's per-decode-batch kv_indices
+                # buffer (triton_backend.py init_forward_metadata), which is
+                # sized as speculative_num_steps * batch_size * topk *
+                # max_context_len -- an ~16x-too-large (131072/8192) transient
+                # allocation on every decode step, causing an intermittent
+                # CUDA OOM there (observed at production batch size: jobs
+                # 5244584, 5305914, 5307396, memory numbers matching this
+                # exactly).
+                #
+                # +spec_verify_tokens when SD is on: sglang's own admission
+                # check (tokenizer_manager.py _validate_one_request) adds a
+                # `reserve_input_token_num` margin -- speculative_num_draft_tokens
+                # tokens -- on top of input+max_new_tokens before comparing to
+                # context_len, to cover the draft/verify process occasionally
+                # emitting a few tokens past the strict max_new_tokens boundary.
+                # verl's own max_new_tokens computation (this file's
+                # `max_new_tokens = min(response_length, max_model_len -
+                # len(generation_prompt_ids) - 1)`) doesn't know about that
+                # margin, so a request sized right up against max_model_len
+                # legitimately overflows the engine's check once context_len
+                # is no longer masked by 131072 tokens of accidental slack
+                # (hit immediately on the first real request once the plain
+                # max_model_len fix above went in: "Requested token count
+                # exceeds the model's maximum context length of 8192 tokens
+                # ... 5582 input + 2657 completion"). Padding context_length
+                # by the same reserve sglang itself adds keeps its admission
+                # check aligned with what verl's arithmetic actually produces,
+                # at negligible cost to the kv_indices buffer size above
+                # (8192 -> 8240, ~0.6%, vs. the original 16x oversizing).
+                context_length=self.config.max_model_len
+                + (self.config.speculative.eagle.spec_verify_tokens if self.use_spec else 0),
                 # rollout.enforce_eager existed in the config but was never passed
                 # to sglang. Its CUDA-graph replay asserts on token counts far from
                 # the captured shapes, which the speculative-decoding path hits on
@@ -1428,7 +1462,15 @@ class SGLangRollout(BaseRollout):
         else:
             sorted_output_req_list = None
 
-        dist.barrier()
+        # Scoped to the TP group, matching the broadcast_pyobj call right below
+        # and every other barrier in this file (e.g. line 802/848) -- an
+        # unscoped dist.barrier() here uses the default WORLD group, which at
+        # TP=1 turns this into a full cross-DP-rank rendezvous. Multi-turn
+        # rollout finish time varies per DP shard (data-dependent turn counts
+        # and response lengths), so that unscoped barrier makes faster DP
+        # ranks wait on slower ones and can trip gloo's default 600s timeout
+        # under enough skew (seen at production batch size: job 5274983).
+        dist.barrier(group=self._device_mesh_cpu["tp"].get_group())
         [sorted_output_req_list] = broadcast_pyobj(
             data=[sorted_output_req_list],
             rank=self._rank,

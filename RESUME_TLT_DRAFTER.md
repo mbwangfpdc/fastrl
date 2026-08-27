@@ -27,6 +27,15 @@ Rollout Engine alone gets real acceptance (2.05-8.50) with the matched pair;
 Adaptive Drafter training now hangs the whole node instead of just
 underperforming.
 
+**UPDATED 2026-08-26** — got a full clean 10-step production-batch (256x5) run
+of the matched pair with Adaptive Rollout Engine (drafter training still off).
+Read `### UPDATE 2026-08-26` below: three real bugs found and fixed (an EAGLE
+buffer sized off the model's unused 128K native context instead of our 8K
+working ceiling; a related SD admission-check margin; a wrong Hydra config
+path for the NCCL collective timeout), and a real quality finding -- the
+paper's own base-model pairing basically doesn't learn on this workload in 10
+steps, unlike the Coder-Instruct target used elsewhere in this comparison.
+
 ---
 
 ## STATUS 2026-08-25 — read this before the older sections
@@ -139,6 +148,96 @@ non-RL control suggested below (`scripts/bench_speculative_decoding.py`, no
 training loop) is still the right next step for isolating whether even THAT
 subsystem's underlying weight-sync path is sound, but do it with
 `DRAFTER_TRAINING` specifically in scope now, not general SD.
+
+---
+
+### UPDATE 2026-08-26: full 10-step production run (256x5), matched pair, Adaptive Drafter still off -- three bugs found and fixed, one real quality finding
+
+Goal: measure reward, generation length, and step latency over 10 steps at
+production batch size, matched pair (`Qwen/Qwen2.5-7B` +
+`mit-han-lab/Qwen2.5-7B-Eagle-RL`), Adaptive Rollout Engine on, Adaptive
+Drafter training off (per the 2026-08-25 finding above). Took 9 attempts to
+get a clean run; three were real bugs worth fixing in-tree, the others were
+config-path/syntax mistakes made along the way. Script:
+`scripts/run_tlt_norafter_prod_slurm.sh` -- its header comment has the full
+attempt-by-attempt log; this section is the summary.
+
+**Bug 1 -- EAGLE draft's kv_indices buffer sized off the model's unused 128K
+native context instead of our 8K working ceiling (real bug, fixed).**
+`AsyncEngine(...)` in `sglang_rollout.py`'s `_init_inference_engine` never
+passed `context_length`, so sglang's `ModelConfig` fell back to the model's
+own native `max_position_embeddings` (131072 for `Qwen2.5-7B`, confirmed via
+both the target's and drafter's `config.json`) instead of our actual
+`max_model_len=8192`. That uncapped value flows straight into
+`TritonAttnBackend.max_context_len`, which directly sizes the EAGLE draft's
+per-decode-batch `kv_indices` buffer
+(`triton_backend.py::init_forward_metadata`) as `speculative_num_steps *
+batch_size * topk * max_context_len` -- ~16x (131072/8192) larger than
+needed, matching the ~3.3 GiB CUDA OOM allocation observed at ~100-concurrent-
+request batch sizes exactly. This is why the OOM hit at wildly different step
+counts across attempts (0, 6, 7, 8, 9) with near-identical memory numbers
+each time -- not a leak, a single oversized transient allocation whose
+success depended on the fragmented pool's momentary layout. Fixed by passing
+`context_length=self.config.max_model_len` (+ bug 2's margin below) to
+`AsyncEngine(...)`. Verified every other `context_len` consumer in sglang
+(10 call sites checked) is unaffected for this workload -- see the fix's
+comment in `sglang_rollout.py` for the full per-site reasoning.
+
+**Bug 2 -- SD verify-token admission margin verl doesn't account for (real
+bug, fixed).** Fixing bug 1 alone immediately exposed a second, previously-
+invisible issue: sglang's own request-admission check
+(`tokenizer_manager.py::_validate_one_request`) adds a `reserve_input_token_num`
+margin (= `speculative_num_draft_tokens`, 48 in our config) on top of
+input+max_new_tokens before comparing to `context_len`, to cover the
+draft/verify process occasionally emitting a few tokens past the strict
+`max_new_tokens` boundary. verl's own `max_new_tokens` computation
+(`sglang_rollout.py`'s `max_new_tokens = min(response_length, max_model_len -
+len(generation_prompt_ids) - 1)`) never knew about that margin -- invisible
+when `context_len` was accidentally 131072 (huge slack), immediately hit once
+`context_len` was correctly capped to 8192 ("Requested token count exceeds
+the model's maximum context length of 8192 tokens ... 5582 input + 2657
+completion"). Fixed by widening `context_length` by that same reserve when SD
+is on (8192 -> 8240, ~0.6%, negligible next to the buffer bug 1 was already
+shrinking 16x).
+
+**Bug 3 -- wrong Hydra config path for the NCCL collective timeout (mistake,
+not a code bug, fixed in the script).** The DP-straggler `dist.barrier()`/
+`ALLREDUCE` timeout from the 2026-08-25 flagship-smoke work (attempt 4 in the
+script header) recurred at production scale. `trainer.nccl_timeout` looked
+like the right Hydra key (it's a documented field in
+`fastrl_trainer.yaml:184`), but the code that actually reads it
+(`fsdp_workers.py`'s `self.config.get("nccl_timeout", 600)` inside
+`ActorRolloutRefWorker.__init__`) reads from `self.config` =
+`config.actor_rollout_ref` as a whole (see `ray_trainer.py:869,889`,
+`config=self.config.actor_rollout_ref`) -- a sibling key to `.actor`/
+`.rollout`/`.model`, NOT `config.trainer`. `trainer.nccl_timeout=1800` parsed
+fine and silently did nothing (the log kept showing `Timeout(ms)=600000`).
+Correct override: `actor_rollout_ref.nccl_timeout=1800` (no `+` prefix --
+Hydra confirmed the key already exists once given the right path).
+
+**Result (job 5359188, rc=0, 3h38m):** all 10 steps completed, mean step time
+~1399s (range 1157-1487s), no OOM, no rejection, no collective timeout.
+**Reward stayed flat at -0.75 to -0.80 across all 10 steps** -- essentially no
+learning, vs. the SD-off Coder-Instruct reference's -0.168 -> 0.562 climb over
+35 steps. **252 of 256 GRPO groups were dropped as zero-signal on every single
+step** (nearly all groups score identically across their 5 rollouts -- almost
+no training signal reaches the optimizer). **Response length stayed
+~2300-2460 tokens with 60-80% of responses hitting the 3000-token cap every
+step** -- the base (non-instruct) model isn't reliably terminating with
+`<solution>`, unlike the Coder-Instruct target. Consequently latency never
+improves either: no downward trend across the 10 steps, unlike the reference
+run's 1150s -> ~460s fall as responses shortened with learning -- this run
+never converges enough to earn that speedup. This confirms and quantifies the
+"tension nobody has resolved yet" section below: paper fidelity (base
+`Qwen2.5-7B` + their drafter) buys a working, stable SD setup, but at a real
+cost in this workload's actual training dynamics, at least within the first
+10 steps.
+
+Per-step metrics only landed for 6 of 10 steps (1, 3, 4, 6, 7, 10) -- the same
+intermittent console-logging gap noted in earlier attempts, confirmed here to
+happen even on completely healthy, non-crashing steps (occurs for both
+2026-08-25 and 2026-08-26 runs alike). Not investigated further; per-step wall
+time is still fully reconstructible from tqdm's own timestamps regardless.
 
 ---
 
