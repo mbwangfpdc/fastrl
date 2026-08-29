@@ -829,7 +829,9 @@ class SGLangRollout(BaseRollout):
         if self._tp_rank == 0:
             loop = _get_or_create_event_loop()
 
-            output = loop.run_until_complete(self._generate_with_drafter(idx_list, image_list, request_sampling_params))
+            output = loop.run_until_complete(
+                self._generate_with_drafter(idx_list, image_list, request_sampling_params, is_validate)
+            )
         else:
             output = None
 
@@ -1074,7 +1076,7 @@ class SGLangRollout(BaseRollout):
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
-    async def _generate_with_drafter(self, idx_list, image_list, request_sampling_params):
+    async def _generate_with_drafter(self, idx_list, image_list, request_sampling_params, is_validate: bool = False):
         """Generate sequences with early memory release using global coordination."""
         current_worker_id = dist.get_rank()
 
@@ -1094,18 +1096,31 @@ class SGLangRollout(BaseRollout):
         )
         logger.info(f"Worker {current_worker_id} successfully generated sequences")
 
-        # Release the actual GPU memory from inference
-        if self.sharding_manager is not None:
-            if self._tp_rank == 0:
-                await self.sharding_manager.release_memory()
+        # Early release is ONLY for opportunistic drafter training (freeing GPU
+        # memory now so the drafter can train on it before the next round). Gated
+        # the same way as _drafter_release_after_generation's identical block
+        # (the multi-turn counterpart of this tail) -- without this guard, this
+        # call fires unconditionally, releasing the KV cache/weights that the
+        # training loop's own round-transition sleep() (fsdp_workers.py ->
+        # rollout.sleep() -> sharding_manager.sleep() -> release_memory()) then
+        # tries to release AGAIN, hitting an already-inactive tag
+        # ("Cannot pause allocation that is not active") and hanging the
+        # subsequent resume. Reproduced with DRAFTER_TRAINING=false: single-turn
+        # generation completes, then the run hangs indefinitely right after this
+        # message, every time, with or without speculative decoding.
+        if self._drafter_training_active(is_validate):
+            # Release the actual GPU memory from inference
+            if self.sharding_manager is not None:
+                if self._tp_rank == 0:
+                    await self.sharding_manager.release_memory()
 
-        # Always empty the CUDA cache to free memory
-        torch.cuda.empty_cache()
+            # Always empty the CUDA cache to free memory
+            torch.cuda.empty_cache()
 
-        # Notify the coordinator about memory release
-        # The coordinator will decide if training should start via broadcast
-        if self.drafter_manager:
-            await self.drafter_manager.release_worker_memory(current_worker_id)
+            # Notify the coordinator about memory release
+            # The coordinator will decide if training should start via broadcast
+            if self.drafter_manager:
+                await self.drafter_manager.release_worker_memory(current_worker_id)
 
         return output
 

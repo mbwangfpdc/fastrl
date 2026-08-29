@@ -33,8 +33,20 @@ GRPO groups were dropped as zero-signal every step** — the paper's base
 this window, unlike the Coder-Instruct target used elsewhere in this
 comparison. With Adaptive Drafter training also on, the flagship smoke config
 still **hangs the whole node** (job 5197256: 12h+ at 0% GPU util, node
-process table exhausted) — unresolved, not yet revisited. See
-`RESUME_TLT_DRAFTER.md`'s `### UPDATE 2026-08-26` for the full writeup.
+process table exhausted) — unresolved, not yet revisited.
+
+**2026-08-29**: the "252/256 zero-signal groups" finding above is confirmed
+real (clean SD on/off ablation, same model, reward -0.80 flat with SD vs
++0.45 climbing without). Found and fixed a real, separate bug along the way:
+single-turn generation (`multi_turn.enable=False`) hung on every run, SD on
+or off, because `_generate_with_drafter` released GPU memory unconditionally
+instead of gating it like its multi-turn sibling does — see that function in
+`sglang_rollout.py`. Whether the diversity collapse itself is specific to
+multi-turn is **still open**: a 16-group single-turn smoke test showed SD-on
+and SD-off collapsing at the same rate (unlike multi-turn's stark gap), but
+that sample size doesn't yet distinguish "not multi-turn-specific" from "too
+small to see it." See `RESUME_TLT_DRAFTER.md`'s `### UPDATE 2026-08-26` and
+`### UPDATE 2026-08-29` for the full writeups.
 
 ## Running it
 

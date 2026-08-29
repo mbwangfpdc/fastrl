@@ -241,6 +241,90 @@ time is still fully reconstructible from tqdm's own timestamps regardless.
 
 ---
 
+### UPDATE 2026-08-29: the "old_log_prob/update_actor 15-20x slower without SD" number wasn't a separate bug -- it's the SAME zero-signal-collapse finding; plus a real single-turn hang bug found and fixed; plus the multi-turn hypothesis is NOT yet confirmed
+
+**Clean SD on/off ablation** (same base `Qwen2.5-7B`, same 256x5 batch, only
+`speculative.enable` flipped, `scripts/run_tlt_sdoff_ablation_slurm.sh` vs.
+`run_tlt_norafter_prod_slurm.sh`): SD OFF learns (reward -0.32 -> +0.45 over 10
+steps, zero-signal groups dropping from 52/256 toward low double digits) while
+SD ON stays flat (-0.80 to -0.75, 252/256 dropped on every single step) --
+this is the real, confirmed effect of SD on this workload's training dynamics,
+not just a latency question.
+
+**The apparent "old_log_prob/update_actor 15-20x slower without SD" anomaly
+noted when this ablation was first run is NOT a separate bug.**
+`filter_zero_signal_groups` runs in `ray_trainer.py` *before*
+`old_log_prob`/`update_actor` (see `# Drop zero-signal groups before any
+training-side compute` at that call site), so those two phases only ever see
+the *surviving* samples -- next to nothing when SD collapses 252/256 groups,
+proportionally far more when only 52/256 collapse. `perf/total_num_tokens`
+(and the wall-clock generation numbers) are measured on the *pre-filter*
+batch (`batch.meta_info["global_token_num"]` is set earlier, at the top of
+the reward block), so it reflects rollout volume, not training volume --
+comparing SD-on's "few total tokens, fast training" against SD-off's "more
+total tokens, slow training" was comparing the wrong pair of numbers. Same
+underlying phenomenon as the diversity-collapse finding, showing up twice.
+
+**A real, separate bug found and fixed: single-turn generation
+(`multi_turn.enable=False`) hung indefinitely on every run, with or without
+SD.** `_generate_with_drafter` (`sglang_rollout.py`, the single-turn
+generation path) called `self.sharding_manager.release_memory()`
+unconditionally after every generation, with no gate on whether opportunistic
+drafter training was actually active -- unlike its multi-turn counterpart
+`_drafter_release_after_generation`, which correctly gates the identical call
+behind `_drafter_training_active()` (`if not
+self._drafter_training_active(is_validate): return`). With
+`DRAFTER_TRAINING=false` (every run in this file), the multi-turn path's gate
+makes that call a no-op, so the KV cache/weights get released exactly once,
+by the training loop's own round-transition `rollout.sleep()`. The
+single-turn path had no such gate, so it released early on every call --
+then the training loop's own `sleep()` tried to release the *same* tag again,
+hit `torch_memory_saver: Cannot pause allocation that is not active`, and the
+run hung for hours with zero further progress (reproduced identically with
+`SPECULATIVE=true` and `SPECULATIVE=false`, confirming it's unrelated to SD).
+Fixed by adding the same `_drafter_training_active()` gate to
+`_generate_with_drafter`'s early-release block (threading `is_validate`
+through from its one call site). Verified: both single-turn smoke jobs now
+complete cleanly (rc=0) where they previously hung for their full 3h
+timeouts.
+
+**With the hang fixed, tested whether the zero-signal collapse is specific to
+multi-turn (hypothesis: a bug in the SQL/multi-turn integration, not a
+general SD effect) -- NOT CONFIRMED at the scale tested.** Same task/model/
+drafter, `multi_turn.enable=False`, 16x4 smoke scale (`scripts/
+run_tlt_singleturn_sdon_slurm.sh` / `_sdoff_slurm.sh`):
+
+* SD ON: 14/16 groups dropped (87.5%)
+* SD OFF: 13/16 -> 14/16 groups dropped (81-87.5%) across 2 steps
+
+Essentially the same collapse rate with or without SD -- nothing like the
+stark 252/256-vs-52/256 gap seen in multi-turn at production scale. Response
+length is also much shorter here (mean ~290-300 tokens vs multi-turn's
+~2300-2450), consistent with the untrained base model just performing
+uniformly poorly at single-shot SQL regardless of SD, rather than SD
+specifically destroying diversity. Two live possibilities, not yet
+distinguished:
+
+1. The multi-turn SD-vs-diversity gap is real but doesn't show up at 16
+   groups (need a production-scale, i.e. 256x5, single-turn run for a fair
+   comparison against the multi-turn numbers -- not yet attempted: the first
+   production-scale single-turn attempt, before the hang fix, also hit a
+   separate long-tail problem at that batch size and was abandoned in favor
+   of the smoke-scale test above).
+2. The diversity-collapse gap is itself specific to the multi-turn
+   integration (tool-call/observation injection interacting with speculative
+   decoding's draft/verify cycle in some way single-turn never exercises),
+   and 16 groups was simply too small a sample either way.
+
+Next step to resolve this: rerun the single-turn SD on/off pair at production
+batch size (256x5) now that the hang is fixed, watching for the same
+long-tail slowness the first attempt hit (single-turn has no natural
+per-turn checkpoint the way multi-turn does, so a handful of straggler
+trajectories running to the full 3000-token cap can dominate wall time --
+worth a shorter `max_response_length` for this specific probe if it recurs).
+
+---
+
 ### THE CURRENT BLOCKER (pistachio, 2026-08-25, superseded by the Oscar runs above for the "does SD itself work" question): matched pair, and speculation still contributes nothing
 
 Ran the full flagship config (paper's matched pair, Adaptive Drafter + Adaptive
