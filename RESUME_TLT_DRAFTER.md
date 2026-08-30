@@ -346,8 +346,18 @@ integration.** Matched 5 steps each, `Qwen/Qwen2.5-7B` +
 
 SD-off score -0.699 -> -0.705 with the drop count falling 92% -> 73% (slow
 learning starting). SD-on never completed a single optimizer step in 5 steps.
-Step time 309s (off) vs 755s (on) -- **2.44x slower** for a drafter that
-accepts nothing (`accept len: 1.00` on every decode batch, as before).
+Step time 309s (off) vs 755s (on) -- **2.44x slower**.
+
+Note on acceptance, because it contradicts the older "blocker" section below:
+**speculation is working normally in these runs.** Over all 383 decode batches
+of the SD-on arm, accept len is mean **2.154**, median 1.61, p90 3.80, max
+5.52, and only 70/383 batches sit at exactly 1.00 (the multi-turn probe is
+mean 2.203, max 9.00). That matches the 2026-08-25 Oscar result (2.05-8.50)
+and confirms the `accept len 1.00` reading from the old pistachio flagship run
+was the wrong-drafter artifact, not a property of this pair. It also makes the
+2.44x slowdown its own oddity -- SD with a mean acceptance above 2 should be
+*faster*, not 2.4x slower -- and it means everything below is happening with a
+healthy, functioning drafter, not a degenerate one.
 
 **2. "Per-step metrics sometimes don't print" is NOT cosmetic -- it is the
 signature of a totally-collapsed step.** The 2026-08-26 section above records
@@ -389,13 +399,18 @@ diversity collapse -- which matters because the fixes are completely
 different, and because the zero-signal counter alone cannot tell the two
 apart (that is what `analyze_group_diversity.py` exists to separate).
 
-**Why this is a correctness bug, not a tuning problem.** Speculative decoding
-is supposed to be distribution-preserving, and with `accept len: 1.00` no
-drafted token is ever accepted -- every emitted token should be the target's
-own bonus token, i.e. SD-on output should be distributionally identical to
-SD-off. It plainly is not. (Caveat stated honestly: 1.00 is a rounded display
-value, so acceptance could be ~0.4%; a sub-1% token substitution rate cannot
-produce a 93% -> 9% swing in tag closure, so the conclusion holds either way.)
+**Why this is a correctness bug, not a tuning problem.** Correct speculative
+decoding is distribution-preserving *at any acceptance rate*: the whole point
+of the draft/verify rejection-sampling scheme is that the emitted sequence is
+drawn from the target model's distribution, so accepting more drafted tokens
+buys latency and nothing else. Enabling it must not change what the model
+writes. Here it changes the output enormously -- 6-7% -> 91-94% of
+trajectories never closing `</sql>`, responses 3.3x longer -- with everything
+else held fixed (same base checkpoint, same prompts, same sampling params,
+same caps, single rollout step, no training in between). And it does so with
+a healthy drafter (mean accept len 2.15), so this is not a
+degenerate-speculation artifact. Something in the verify/accept path is
+emitting tokens the target model would not have emitted.
 Ruled out while chasing this, all worth not re-checking:
 * Relaxed acceptance thresholds -- `speculative_accept_threshold_single/acc`
   both default to 1.0 (strict) and are not set anywhere here.

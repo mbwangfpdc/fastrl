@@ -55,7 +55,9 @@ supersedes the "diversity collapse" language above. The single-turn 256x5 pair
 `SPECULATIVE`) reproduces the collapse, so it is **not** multi-turn-specific:
 SD-off drops 236 -> 188 of 256 groups and starts learning, SD-on drops
 **256/256 on all 5 steps and never runs a single optimizer step**, at 2.44x
-the step time. A 2x2 rollout-only probe over the trajectory text
+the step time — and with speculation working *normally* (mean accept len
+2.15, max 5.52), so this is not the old wrong-drafter artifact. A 2x2
+rollout-only probe over the trajectory text
 (`scripts/run_tlt_diversity_probe.sh` + `scripts/analyze_group_diversity.py`)
 gives the mechanism: **enabling SD makes responses ~3.3x longer and takes
 `</sql>` closure from 6-7% missing to 91-94% missing**, which in multi-turn
