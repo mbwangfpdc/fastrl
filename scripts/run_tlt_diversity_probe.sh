@@ -58,9 +58,16 @@ MULTI_TURN=${MULTI_TURN:-true}
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.5}
 TRAIN_PROMPT_BSZ=256; MINI_BSZ=256; N_RESP=5
 
+# CUDA graphs are OFF by default here to match granular's vllm_enforce_eager,
+# but ENFORCE_EAGER=false is a deliberate diagnostic: the eager tree-verify
+# path is far less exercised than the graph-captured one, so if the output
+# corruption disappears with graphs on, the bug is in the eager path.
+ENFORCE_EAGER=${ENFORCE_EAGER:-true}
+
 if [ "$SPECULATIVE" = "true" ]; then ARM=sdon; else ARM=sdoff; fi
 if [ "$MULTI_TURN" = "true" ]; then TURN=mt; else TURN=st; fi
 RUN_TAG="tlt-probe-${TURN}-${ARM}"
+if [ "$ENFORCE_EAGER" != "true" ]; then RUN_TAG="${RUN_TAG}-graphs"; fi
 OUT="$REPO/output/$RUN_TAG"
 mkdir -p "$OUT/rollouts"
 
@@ -93,6 +100,22 @@ MT_ARGS=()
 if [ "$MULTI_TURN" != "true" ]; then
   MT_ARGS+=(actor_rollout_ref.rollout.multi_turn.enable=False)
 fi
+# GREEDY=1 forces temperature 0. This is the sharpest available test of
+# whether SD is distribution-preserving: under greedy decoding correct
+# speculative decoding is not merely distributionally equivalent but
+# BIT-IDENTICAL to non-speculative decoding (a draft token is accepted iff it
+# equals the target's argmax), so any difference at all is a definite bug. It
+# also routes through a different kernel -- `verify_tree_greedy` instead of
+# `tree_speculative_sampling_target_only` (see eagle_info.py's
+# `if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE`) -- so comparing greedy
+# against sampled localises the defect: corruption in BOTH implicates the
+# shared tree/KV plumbing, corruption only when sampling implicates the
+# stochastic accept kernel.
+if [ "${GREEDY:-0}" = "1" ]; then
+  MT_ARGS+=(actor_rollout_ref.rollout.temperature=0)
+  RUN_TAG="${RUN_TAG}-greedy"; OUT="$REPO/output/$RUN_TAG"; mkdir -p "$OUT/rollouts"
+fi
+
 set +e
 timeout 10800 env \
 MODEL_PATH=Qwen/Qwen2.5-7B \
@@ -100,7 +123,7 @@ MODEL_PATH=Qwen/Qwen2.5-7B \
 SPECULATIVE=$SPECULATIVE \
 DRAFTER_TRAINING=false \
 DRAFTER_COLLECT_SGL=false \
-ENFORCE_EAGER=true \
+ENFORCE_EAGER=$ENFORCE_EAGER \
 NGPUS=4 TP=1 \
 TRAIN_PROMPT_BSZ=$TRAIN_PROMPT_BSZ MINI_BSZ=$MINI_BSZ N_RESP=$N_RESP \
 MAX_STEPS=1 \

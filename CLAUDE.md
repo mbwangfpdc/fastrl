@@ -71,6 +71,22 @@ update (grep `every group was zero-signal`); and a 2-token KV-pool accounting
 leak kills the scheduler on the single-turn path at step 6, worked around by
 opt-in `SGLANG_TOLERATE_KV_LEAK=1`, still unfixed.
 
+**2026-08-30b — root cause narrowed; see `### UPDATE 2026-08-30b`.** SD is
+**injecting junk tokens**, not shifting a distribution: greedy SD-on output
+has 23,048 non-ASCII fragments vs SD-off's 2, spliced into otherwise-coherent
+text (`<think>ük>First teh, I will checkük if the 'ükApartükmentsük' table`).
+Under greedy — where correct SD is *bit-identical*, not merely
+distribution-preserving — SD-on still misses `</sql>` 91.1% of the time vs
+3.9%, and returns 4.66 different answers per 5 identical prompts (SD-off:
+1.50), so the defect is **nondeterministic and batch/state-dependent**.
+Eliminated with evidence: the stochastic accept kernel (greedy uses a
+different one and still corrupts), `enforce_eager`, an uninitialised `predict`
+buffer (sentinel test), the `context_length` cap, relaxed accept thresholds,
+the greedy fallback, verify-path sampling params, and a stale drafter
+embed/lm_head. Next: a standalone sglang control with no verl, then a
+concurrency sweep — prime suspect is cross-request state corruption in the
+tree/KV plumbing, which would also explain the allocator leak.
+
 ## Running it
 
 `examples/grpo_sql_baseline.sh` is the entry point; every execution knob is an

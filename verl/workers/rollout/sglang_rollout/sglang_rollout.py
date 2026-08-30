@@ -517,7 +517,18 @@ class SGLangRollout(BaseRollout):
                 # check aligned with what verl's arithmetic actually produces,
                 # at negligible cost to the kv_indices buffer size above
                 # (8192 -> 8240, ~0.6%, vs. the original 16x oversizing).
-                context_length=self.config.max_model_len
+                # DIAGNOSTIC OVERRIDE (FASTRL_ENGINE_CONTEXT_LEN): this value
+                # sizes the EAGLE draft's kv_indices buffer, and SD-on output
+                # is measurably corrupted (91-94% of trajectories never close
+                # `</sql>`, degenerating into repeated junk) on runs made after
+                # the cap above went in, where runs from before it -- when
+                # sglang defaulted context_len to the model's native 131072 --
+                # were clean. Setting this env var restores an arbitrary
+                # (large) value so that suspicion can be A/B'd directly
+                # without reverting the OOM fix. Unset in normal operation.
+                context_length=int(os.environ["FASTRL_ENGINE_CONTEXT_LEN"])
+                if os.environ.get("FASTRL_ENGINE_CONTEXT_LEN")
+                else self.config.max_model_len
                 + (self.config.speculative.eagle.spec_verify_tokens if self.use_spec else 0),
                 # rollout.enforce_eager existed in the config but was never passed
                 # to sglang. Its CUDA-graph replay asserts on token counts far from

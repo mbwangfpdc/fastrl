@@ -467,6 +467,115 @@ the longest-generation cell); it completes at `GPU_MEM_UTIL=0.4`.
 
 ---
 
+### UPDATE 2026-08-30b: root-cause hunt. SD is injecting junk tokens, it is NOT a sampling-distribution effect, and eight candidate causes are eliminated.
+
+Follow-up to the above, chasing "SD should only change decode latency". It
+does not: **SD emits tokens the target model never selected.** Reading the
+actual dumped text rather than the aggregate metrics makes it obvious:
+
+```
+SD-off : <think>I will first check if the 'Apartments' table exists and contains entri
+SD-on  : <think>ük>First teh, I will checkük if the 'ükApartükmentsük' table exists Qty
+```
+
+A foreign token is spliced repeatedly into otherwise-coherent text, which then
+degenerates into repetition loops. Counting non-ASCII fragments over the 256
+greedy prompts: **SD-on 23,048, SD-off 2**, dominated by `哈哈哈哈` and `啊`.
+
+**The decisive experiment is greedy decoding.** Under sampling, two runs
+legitimately differ token-for-token (different RNG streams), so no
+distributional argument is clean. Under temperature 0 correct speculative
+decoding is *bit-identical* to non-speculative decoding -- a draft token is
+accepted iff it equals the target's argmax -- so any difference is a definite
+bug. Greedy, single-turn, 256 prompts:
+
+| greedy | `</sql>` missing | resp_chars | unique of 5 |
+|---|---|---|---|
+| SD OFF | **3.9%** | 1041 | 1.50 |
+| SD ON  | **91.1%** | 6599 | **4.66** |
+
+Two things follow. The corruption survives greedy, and greedy runs a
+*different* kernel (`verify_tree_greedy`, not
+`tree_speculative_sampling_target_only`), so the stochastic accept math is not
+the cause. And `unique of 5 = 4.66 at temperature 0` means SD-on returns a
+*different* answer almost every time for the same prompt, where SD-off is
+near-deterministic at 1.50 -- so the defect is **nondeterministic and
+batch/state-dependent**, not a mis-specified distribution. That is the
+signature of cross-request state corruption, which also fits the 2-token KV
+allocator leak reported above firing on this same path.
+
+**Eliminated, with the evidence, so nobody re-chases them:**
+
+1. *Stochastic accept kernel / rejection-sampling math* -- corruption is
+   identical under greedy, which does not use that kernel.
+2. *`enforce_eager` / CUDA graphs off* (hypothesis 3 of the old blocker
+   section) -- re-ran with `ENFORCE_EAGER=false`: `</sql>` missing 92.0% vs
+   91.4% eager. No effect. CUDA-graphs-off is NOT in conflict with TLT.
+3. *Uninitialised `predict` buffer* -- `eagle_info.py` allocates it with
+   `torch.empty`, so an `accept_index` pointing at an unwritten slot would
+   read junk. Tested by filling it with a known sentinel token
+   (`FASTRL_PREDICT_SENTINEL=9008`, `' Initialize'`): the sentinel does NOT
+   appear in the output (1 occurrence) and the junk persists (8,748
+   fragments). The kernel does write those slots -- with wrong ids. Refuted.
+4. *The `context_length` cap from `75df8ae` shrinking the EAGLE `kv_indices`
+   buffer* -- the buffer is `bs * topk * max_context_len` wide and the slice
+   needs `seq_lens_sum * topk + bs*(i+1)`, and every `seq_len <= context_len`
+   by admission, so it cannot overflow. (The A/B via
+   `FASTRL_ENGINE_CONTEXT_LEN=131072` OOMs, which is exactly the bug that
+   commit fixed, so it is not runnable at this batch size anyway.)
+5. *Relaxed acceptance thresholds* -- `speculative_accept_threshold_single`
+   and `_acc` both default to 1.0 (strict) and are set nowhere.
+6. *The greedy-verification fallback* -- would collapse a group outright, but
+   it is gated on `not TREE_SPEC_KERNEL_AVAILABLE` = `not is_cuda()`, false here.
+7. *Sampling-params plumbing in the verify path* -- temperature IS applied
+   (`next_token_logits / expanded_temperature`), top-k and top-p are both
+   renormalised, `top_k=-1` normalises to `TOP_K_ALL` (a no-op), and the run
+   sets no penalties or `min_p`. Matches the normal sampler's effective behaviour.
+8. *Drafter holding stale embed/lm_head* -- `eagle_worker.py` shares the
+   target's embed and head **by reference at init**
+   (`get_embed_and_head()` -> `set_embed_and_head`), and verl inits the target
+   with `load_format='dummy_dtensor'` (random) and syncs real weights after,
+   so this looked like the answer. But sglang's `default_weight_loader` does
+   `param.data.copy_()` -- in-place -- so the shared references do see the
+   real weights. Refuted (worth re-checking if a non-default loader path is
+   ever used).
+
+Also worth recording: `accept len` is **not** 1.00 in these runs (mean 2.15
+sampled, 1.49 greedy, max 5.52), so this is a *functioning* drafter corrupting
+output, not a degenerate one.
+
+**Where to go next**, in order:
+
+1. **Standalone sglang control, no verl.** Same target+drafter, real
+   checkpoint (no `dummy_dtensor`), greedy, one fixed prompt set, SD on vs
+   off. This is the one test that separates "sglang/EAGLE bug" from "verl
+   integration bug" and it has been on the list since 2026-08-25 without being
+   run. Everything above is inside the RL harness.
+2. **Concurrency sweep.** Corruption is nondeterministic and batch-dependent,
+   so drive `max_running_requests` down to 1 and back up. If it disappears at
+   1, it is definitively cross-request state contamination in the tree/KV
+   plumbing, which would also explain the 2-token allocator leak, and the two
+   should be fixed together.
+3. Only then dig into the tree/KV bookkeeping itself (`eagle_info.py`'s
+   `verify` -> `accept_index` / `evict_mask` / `assign_req_to_token_pool`).
+
+Repro for the greedy pair and the diagnostics:
+
+```bash
+MULTI_TURN=false SPECULATIVE=false GREEDY=1 bash scripts/run_tlt_diversity_probe.sh
+MULTI_TURN=false SPECULATIVE=true  GREEDY=1 bash scripts/run_tlt_diversity_probe.sh
+.venv/bin/python scripts/compare_runs_bitwise.py \
+  output/tlt-probe-st-sdoff-greedy/rollouts/step1.jsonl \
+  output/tlt-probe-st-sdon-greedy/rollouts/step1.jsonl
+```
+
+`compare_runs_bitwise.py` prints exact-match rate and the first divergence per
+prompt; the archived dumps for every cell are in `output/probe_archive/`
+(not in git). Both diagnostic env vars (`FASTRL_PREDICT_SENTINEL`,
+`FASTRL_ENGINE_CONTEXT_LEN`) are unset by default and change nothing when unset.
+
+---
+
 ### THE CURRENT BLOCKER (pistachio, 2026-08-25, superseded by the Oscar runs above for the "does SD itself work" question): matched pair, and speculation still contributes nothing
 
 Ran the full flagship config (paper's matched pair, Adaptive Drafter + Adaptive
