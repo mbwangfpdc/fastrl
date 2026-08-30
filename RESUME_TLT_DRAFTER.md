@@ -325,6 +325,133 @@ worth a shorter `max_response_length` for this specific probe if it recurs).
 
 ---
 
+### UPDATE 2026-08-30 (pistachio): question answered -- the collapse is NOT multi-turn-specific, and it is NOT a GRPO diversity collapse. SD stops generations ever closing `</sql>`.
+
+Ran the single-turn 256x5 SD on/off pair this file asked for, then a 2x2
+rollout-only probe (turn mode x SD) that measures the trajectory *text*
+rather than the zero-signal counter. Both arms of the training ablation come
+from ONE parameterised script (`scripts/run_tlt_singleturn_prod_local.sh`,
+`SPECULATIVE` is the only input that differs) rather than two hand-synced
+scripts -- the previous single-turn pair had already drifted, only the SD-on
+one carrying the `nccl_timeout` override.
+
+**1. The collapse reproduces in single-turn, so it is not the multi-turn
+integration.** Matched 5 steps each, `Qwen/Qwen2.5-7B` +
+`mit-han-lab/Qwen2.5-7B-Eagle-RL`, everything else identical:
+
+| single-turn 256x5 | zero-signal groups per step | steps with NO update at all |
+|---|---|---|
+| SD OFF | 236, 236, 224, 216, 188 / 256 | 0/5 |
+| SD ON  | 256, 256, 256, 256, 256 / 256 | **5/5** |
+
+SD-off score -0.699 -> -0.705 with the drop count falling 92% -> 73% (slow
+learning starting). SD-on never completed a single optimizer step in 5 steps.
+Step time 309s (off) vs 755s (on) -- **2.44x slower** for a drafter that
+accepts nothing (`accept len: 1.00` on every decode batch, as before).
+
+**2. "Per-step metrics sometimes don't print" is NOT cosmetic -- it is the
+signature of a totally-collapsed step.** The 2026-08-26 section above records
+metrics landing for only 6 of 10 steps and calls the gap harmless, "confirmed
+to happen even on completely healthy, non-crashing steps". It isn't:
+`ray_trainer.py`'s `drop_zero_signal` branch, when `n_grp == -1` (every group
+zero-signal), prints `[drop_zero_signal] step N: every group was zero-signal`,
+bumps the step and `continue`s -- never reaching the metrics assembly or the
+console logger. A missing metrics line therefore *means* 256/256 collapsed
+with no update. So the multi-turn SD-on production run was worse than
+recorded: 252/256 on the six steps that logged, and 256/256 on the four that
+did not. Grep `every group was zero-signal`, not just the metrics line.
+
+**3. Root cause: SD stops generations from ever closing `</sql>`.** 2x2
+rollout-only probe (`scripts/run_tlt_diversity_probe.sh` +
+`scripts/analyze_group_diversity.py`), 1280 trajectories per cell, same base
+checkpoint and prompts, dumped pre-filter:
+
+| cell | resp_chars | turns/traj | `</sql>` missing | `<solution>` present | mean uniq /5 |
+|---|---|---|---|---|---|
+| multi-turn, SD off | 3716 | **3.08** | 6.0% | **54.0%** | 4.99 |
+| multi-turn, SD on  | 12373 | **0.97** | **94.0%** | 2.1% | 5.00 |
+| single-turn, SD off | 1270 | 0.00 | 7.3% | 2.0% | 4.98 |
+| single-turn, SD on  | 4473 | 0.01 | **91.4%** | 3.4% | 5.00 |
+
+Turning SD on makes responses ~3.3x longer and takes `</sql>` closure from
+6-7% missing to 91-94% missing, in BOTH turn modes. In multi-turn that severs
+the agent loop: turns/trajectory 3.08 -> 0.97, half of all trajectories never
+complete even one tool round-trip, `<solution>` production falls 54% -> 2%,
+so essentially every rollout takes `sql_reward.py`'s -1.0 format-error path,
+every group in the batch scores identically, and every group is dropped.
+
+**This means the "SD destroys GRPO sampling diversity" framing earlier in this
+file is wrong.** Within-group diversity is *perfect* in all four cells --
+`exact_dup_rate` 0.000 everywhere, mean unique completions 4.98-5.00 out of 5.
+The rollouts are all different from each other; they are uniformly *unscorable*.
+It is a termination/format collapse that yields uniform -1.0 rewards, not a
+diversity collapse -- which matters because the fixes are completely
+different, and because the zero-signal counter alone cannot tell the two
+apart (that is what `analyze_group_diversity.py` exists to separate).
+
+**Why this is a correctness bug, not a tuning problem.** Speculative decoding
+is supposed to be distribution-preserving, and with `accept len: 1.00` no
+drafted token is ever accepted -- every emitted token should be the target's
+own bonus token, i.e. SD-on output should be distributionally identical to
+SD-off. It plainly is not. (Caveat stated honestly: 1.00 is a rounded display
+value, so acceptance could be ~0.4%; a sub-1% token substitution rate cannot
+produce a 93% -> 9% swing in tag closure, so the conclusion holds either way.)
+Ruled out while chasing this, all worth not re-checking:
+* Relaxed acceptance thresholds -- `speculative_accept_threshold_single/acc`
+  both default to 1.0 (strict) and are not set anywhere here.
+* The greedy-verification fallback -- `eagle_info.py` falls back to
+  `verify_tree_greedy` when `not TREE_SPEC_KERNEL_AVAILABLE`, which would
+  collapse a GRPO group outright; but that flag is `is_cuda()`, true here.
+* Sampling-params plumbing in the verify path -- temperature IS applied
+  (`next_token_logits / expanded_temperature`) and top-k/top-p are both
+  renormalised before rejection sampling.
+* Missed stop-string detection under multi-token steps -- `check_finished`
+  runs after all accepted tokens are appended and tests `stop_str in
+  self.decoded_text`, and anyway the tag is *absent* from the text, not
+  overshot, so nothing was missed: it was never generated.
+
+That leaves the tree acceptance/residual sampling itself
+(`tree_speculative_sampling_target_only`, called with `draft_probs` all
+zeros) as the prime suspect. Next step is a non-RL control: generate a fixed
+prompt set through plain sglang with this pair, SD on vs off, and compare
+`</sql>` closure and length -- if it reproduces with no training loop at all,
+it is purely an engine bug and can be reported/fixed as one.
+
+**4. New bug found: a 2-token KV-pool leak kills the scheduler on the
+single-turn path.** `scheduler.py::check_memory`, run from
+`self_check_during_idle()` between steps, is a strict equality test and fired
+at step 6 of 10 with `max_total_num_tokens=135945` vs
+`available_size=2879 + evictable_size=133064` = 135943 -- two tokens, 0.0015%,
+which cannot exhaust anything, but it raises and takes the whole job down
+(scheduler dead, GPUs idle, run hung). Multi-turn production runs never hit
+it, so it looks specific to the single-turn path -- the same under-tested path
+that produced the `release_memory()` hang fixed in `b793853`. NOT fixed: made
+tolerable behind opt-in `SGLANG_TOLERATE_KV_LEAK=1` (off by default, set by
+both ablation scripts so the arms stay symmetric) purely so a diagnostic can
+finish. The accounting bug still wants a root cause.
+
+**Also worth knowing:** single-turn is a poor discriminator in absolute terms
+regardless of SD -- with SD off it still drops 92% of groups, because the SQL
+prompt is agentic and only 2.0% of one-shot rollouts ever emit `<solution>`
+(vs 54.0% in multi-turn). That is a prompt/protocol artifact, not evidence
+about SD, and it is why the 16-group smoke looked inconclusive. The SD effect
+is still visible on top of it (92% -> 100%, and 0/5 -> 5/5 dead steps).
+
+Reproduce:
+
+```bash
+SPECULATIVE=false MAX_STEPS=10 bash scripts/run_tlt_singleturn_prod_local.sh
+SPECULATIVE=true  MAX_STEPS=10 bash scripts/run_tlt_singleturn_prod_local.sh
+for mt in true false; do for sd in true false; do
+  MULTI_TURN=$mt SPECULATIVE=$sd bash scripts/run_tlt_diversity_probe.sh
+done; done
+```
+
+The multi-turn SD-on probe OOMs at `GPU_MEM_UTIL=0.5` (Triton CUDA OOM, it is
+the longest-generation cell); it completes at `GPU_MEM_UTIL=0.4`.
+
+---
+
 ### THE CURRENT BLOCKER (pistachio, 2026-08-25, superseded by the Oscar runs above for the "does SD itself work" question): matched pair, and speculation still contributes nothing
 
 Ran the full flagship config (paper's matched pair, Adaptive Drafter + Adaptive

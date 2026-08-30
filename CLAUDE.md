@@ -48,6 +48,27 @@ that sample size doesn't yet distinguish "not multi-turn-specific" from "too
 small to see it." See `RESUME_TLT_DRAFTER.md`'s `### UPDATE 2026-08-26` and
 `### UPDATE 2026-08-29` for the full writeups.
 
+**2026-08-30 — that open question is now answered, and the explanation for it
+changes.** Read `### UPDATE 2026-08-30` in `RESUME_TLT_DRAFTER.md`; it
+supersedes the "diversity collapse" language above. The single-turn 256x5 pair
+(`scripts/run_tlt_singleturn_prod_local.sh`, one script parameterised by
+`SPECULATIVE`) reproduces the collapse, so it is **not** multi-turn-specific:
+SD-off drops 236 -> 188 of 256 groups and starts learning, SD-on drops
+**256/256 on all 5 steps and never runs a single optimizer step**, at 2.44x
+the step time. A 2x2 rollout-only probe over the trajectory text
+(`scripts/run_tlt_diversity_probe.sh` + `scripts/analyze_group_diversity.py`)
+gives the mechanism: **enabling SD makes responses ~3.3x longer and takes
+`</sql>` closure from 6-7% missing to 91-94% missing**, which in multi-turn
+severs the agent loop (3.08 -> 0.97 turns, `<solution>` 54% -> 2%) so every
+rollout hits the -1.0 format-error path and every group ties. Within-group
+diversity is *perfect* in all four cells (`exact_dup_rate` 0.000, 4.98-5.00
+unique of 5) — it is a termination/format collapse, not a diversity collapse.
+Two smaller results worth knowing: a missing per-step metrics line is not
+cosmetic, it is exactly the signature of a 256/256 step that skipped its
+update (grep `every group was zero-signal`); and a 2-token KV-pool accounting
+leak kills the scheduler on the single-turn path at step 6, worked around by
+opt-in `SGLANG_TOLERATE_KV_LEAK=1`, still unfixed.
+
 ## Running it
 
 `examples/grpo_sql_baseline.sh` is the entry point; every execution knob is an
