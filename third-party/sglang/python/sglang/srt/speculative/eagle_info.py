@@ -1,4 +1,5 @@
 import logging
+import os
 from copy import copy
 from dataclasses import dataclass
 from typing import ClassVar, List, Optional, Tuple
@@ -50,6 +51,13 @@ elif is_hip():
     from sgl_kernel import verify_tree_greedy
 
 logger = logging.getLogger(__name__)
+
+# See EagleVerifyInput.verify's greedy branch: a module-level counter, not an
+# instance attribute, because EagleVerifyInput is a fresh dataclass instance
+# every decode round (built in draft()'s build_tree_kernel_efficient call) --
+# an instance attribute would silently reset to 0 every round and every dump
+# would overwrite round00000.pt.
+_debug_verify_round_counter = [0]
 
 
 @dataclass
@@ -287,6 +295,36 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 retrive_next_sibling=self.retrive_next_sibling,
                 target_predict=target_predict,
             )
+
+            # RESUME_TLT_DRAFTER.md UPDATE 2026-08-31b: dump every greedy
+            # verify round's inputs and the kernel's outputs so an
+            # independent Python re-walk (scripts/check_verify_tree_greedy.py)
+            # can check the kernel's own accept decision against its own
+            # inputs, isolating a kernel-logic bug from a
+            # context/numerics one. Gated -- adds a host sync (.cpu()) per
+            # round, so opt-in only.
+            debug_dir = os.environ.get("FASTRL_DEBUG_VERIFY_DIR")
+            if debug_dir:
+                os.makedirs(debug_dir, exist_ok=True)
+                idx = _debug_verify_round_counter[0]
+                _debug_verify_round_counter[0] += 1
+                torch.save(
+                    {
+                        "candidates": candidates.cpu(),
+                        "retrive_index": self.retrive_index.cpu(),
+                        "retrive_next_token": self.retrive_next_token.cpu(),
+                        "retrive_next_sibling": self.retrive_next_sibling.cpu(),
+                        "target_predict": target_predict.cpu(),
+                        "predicts": predict.cpu(),
+                        "accept_index": accept_index.cpu(),
+                        "accept_length": accept_length.cpu(),
+                    },
+                    # pid in the filename: with multiple independent rollout
+                    # engines (one per GPU) all writing into the same
+                    # debug_dir, a bare per-process round counter collides
+                    # across engines.
+                    os.path.join(debug_dir, f"pid{os.getpid()}_round{idx:05d}.pt"),
+                )
         else:
             # apply temperature and get target probs
             expanded_temperature = torch.repeat_interleave(

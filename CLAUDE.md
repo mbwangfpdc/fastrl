@@ -133,6 +133,23 @@ needs proving, not assuming. Next: an independent Python re-walk of
 diffed against its output, to settle kernel-logic-bug vs. context/numerics before
 going further.
 
+**2026-08-31 (later still) — kernel-logic bug RULED OUT.** Read
+`### UPDATE 2026-08-31c` in `RESUME_TLT_DRAFTER.md`. Did that re-walk
+(`scripts/check_verify_tree_greedy.py`, verified against the kernel's own unit
+test first): `accept_length`/`accept_index` -- the kernel's actual decision --
+match on **155/155 real production verify rounds**, across 4 independent
+rollout engines. (A first pass claimed 0/155 disagreed; that was a checker bug
+comparing against the wrong sentinel for the `predicts` scratch buffer's
+uninitialised-and-never-read positions, not a real mismatch -- fixed before
+trusting the result.) So the residual SD/non-SD divergence is not a
+kernel-logic bug. It must be that `target_predict` itself (the target model's
+argmax at each verify-step candidate) differs from what a plain non-speculative
+decode would compute at the identical context -- either leftover context/KV
+corruption of the same family as the bug already fixed, or genuine
+floating-point drift from the verify step's multi-candidate forward-pass shape.
+Next: capture `target_predict` at a real verify round and diff it against a
+plain SD-off decode over the identical prefix.
+
 ## Running it
 
 `examples/grpo_sql_baseline.sh` is the entry point; every execution knob is an

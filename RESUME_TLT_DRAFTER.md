@@ -1036,3 +1036,48 @@ non-speculative decode would compute at the identical context -- if it does
 NOT, that is context corruption, a bug of the same family as the one just
 fixed; if it DOES, the floating-point-drift theory is confirmed rather than
 just plausible.
+
+### UPDATE 2026-08-31c (Oscar): kernel-logic bug RULED OUT -- verify_tree_greedy agrees with an independent Python re-walk on 155/155 real production rounds
+
+Step (1) from the previous entry, done. `eagle_info.py::verify`'s greedy
+branch now dumps every round's kernel inputs (`candidates`, `retrive_index`,
+`retrive_next_token`, `retrive_next_sibling`, `target_predict`) and outputs
+(`predicts`, `accept_index`, `accept_length`) behind `FASTRL_DEBUG_VERIFY_DIR`
+(unset by default, zero cost). `scripts/check_verify_tree_greedy.py`
+reimplements the kernel's tree-walk in pure Python -- reverse-engineered from
+`sgl-kernel/tests/speculative/test_eagle_utils.py`'s own worked example and
+verified to reproduce that test's expected output exactly before trusting it
+on anything else -- and diffs it against the dumps.
+
+**First pass gave a false alarm.** `scripts/run_tlt_verify_dump_slurm.sh`
+(batch=4/1-per-engine isolation, greedy, `MAX_RESPONSE_LENGTH=128`) came back
+0/155 "disagreements" -- but the entire disagreement was in the raw `predicts`
+scratch buffer at positions NEITHER side ever visited. Production
+`eagle_info.py` allocates that buffer with `torch.empty(...)` (uninitialised);
+the kernel's own unit test allocates it with `torch.full(..., -1)` for test
+convenience. Untouched slots in the real dump hold literal GPU garbage
+(`1008536334`, `-1063124992`, ...) where my Python re-walk defaults to `-1` --
+so the mismatch was an artifact of comparing against the wrong sentinel, not a
+bug. This independently confirms, with direct evidence this time, what
+`UPDATE 2026-08-31` had already refuted without it: the predict buffer really
+is uninitialised outside the accepted path, and it is provably never read
+there (see next paragraph), so it cannot affect output.
+
+**Corrected: only compare positions the walk actually visited.** Re-run with
+that fix: **`accept_length` and `accept_index` -- the kernel's actual
+decision, and the only fields anything downstream reads -- match the
+independent Python re-walk on all 155/155 real rounds**, across 4 independent
+rollout engines, zero exceptions. The kernel is not the bug.
+
+**What this leaves.** With the kernel logic cleared, the residual SD/non-SD
+divergence must trace to `target_predict` itself -- the target model's own
+argmax at each verify-step candidate position -- differing from what the
+identical context would produce under a plain, non-speculative decode. That is
+either (a) context/KV corruption of the same family as the bug fixed in
+`UPDATE 2026-08-31` (still present somewhere in the ordinary, non-downgraded
+SD path this test exercised), or (b) genuine floating-point drift from the
+verify step's multi-candidate-per-request forward-pass shape differing from
+single-token decode's. Not yet distinguished. The direct test: capture
+`target_predict`'s first-position argmax (or better, the raw logits) at a
+verify round, then independently run a plain SD-off decode up to the
+identical prefix and diff. If they match, (b); if they don't, (a).
