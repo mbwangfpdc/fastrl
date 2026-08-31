@@ -87,6 +87,36 @@ embed/lm_head. Next: a standalone sglang control with no verl, then a
 concurrency sweep — prime suspect is cross-request state corruption in the
 tree/KV plumbing, which would also explain the allocator leak.
 
+**2026-08-31 - SOLVED, and it was OUR bug, not FastRL's. Read
+`### UPDATE 2026-08-31` in `RESUME_TLT_DRAFTER.md`; it supersedes the
+"cross-request state corruption" framing above.** Our commit `0f7c378` added a
+`batch.prepare_for_decode(skip_prepare=False)` to the adaptive-downgrade branch of
+`EAGLEWorker.forward_batch_generation`, justified by a comment claiming
+`skip_prepare` is decided from the static engine-level `spec_algorithm`. It is
+decided from the *per-batch* field, and upstream `Scheduler.update_running_batch`
+(`scheduler.py:2229-2238`) already sets that field to NONE and prepares the batch
+whenever `batch_size > bs_threshold`. So we prepared it twice. Each
+`prepare_for_decode` calls `alloc_for_decode`, which allocates a KV slot per
+request, maps it at `seq_lens`, then does `seq_lens.add_(1)` - so the first slot
+was allocated, mapped, never written and never freed, and every decode step read
+one phantom token of another request's stale KV while `seq_lens` advanced 2 per
+real token. It only bit above `bs_threshold` (32), i.e. only at production batch,
+which is why smoke-scale runs looked clean and why this masqueraded as a
+regression after `75df8ae` (that commit merely made production-scale runs possible;
+`0f7c378` predates it). Fix: read `spec_algorithm.is_none()` before clobbering it
+and skip the redundant prepare, keeping the manual one only for the
+`batch_size <= threshold` warmup case upstream does not cover. Measured at a fixed
+config, greedy, only the code varying: junk tokens 102,415 -> 10 (SD-off: 10),
+`</sql>` never closed 88.6% -> 5.0% (SD-off: 3.4%), mean response 5722 -> 1156
+chars. SD-off vs SD-off is bitwise 1.000, so the surviving 0.438 SD-on/SD-off match
+is real and unexplained-in-proof, though junk-free, length-matched and itself
+deterministic at 0.992 - most likely verify-step batch-shape numerics. Refuted
+along the way (diagnostics removed, `eagle_info.py` back to pristine upstream): the
+uninitialised `predict` buffer and the `context_length` cap. The KV-pool leak is
+almost certainly the same defect but is **unverified** - `SGLANG_TOLERATE_KV_LEAK`
+stays until a training run confirms. Next: re-run the 256x5 single-turn SD on/off
+training ablation, which pre-fix collapsed 256/256 groups every step.
+
 ## Running it
 
 `examples/grpo_sql_baseline.sh` is the entry point; every execution knob is an

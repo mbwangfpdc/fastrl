@@ -828,3 +828,128 @@ pushing was forbidden. That was stale.
   next run dies with `EADDRINUSE`. Reap before relaunching.
 * `ray stop --force` will try (and fail) to kill collaborators' GCS servers —
   harmless, but don't chase it.
+
+---
+
+### UPDATE 2026-08-31: ROOT CAUSE FOUND AND FIXED. It was our patch, not FastRL. A double `prepare_for_decode` on the adaptive-downgrade path was injecting stale KV into every decode step.
+
+`### UPDATE 2026-08-30b` narrowed this to "cross-request state corruption in the
+tree/KV plumbing" and listed a standalone-sglang control as the next step. That
+control was never needed: assuming upstream FastRL is correct and auditing only
+our own diff found it immediately.
+
+**The bug.** Commit `0f7c378` (our fix for the adaptive-SD multi-turn crash) added
+this to `EAGLEWorker.forward_batch_generation`'s `if not enable_sd:` branch in
+`third-party/sglang/python/sglang/srt/speculative/eagle_worker.py`:
+
+```python
+batch.spec_algorithm = SpeculativeAlgorithm.NONE
+batch.spec_info = None
+batch.output_ids = torch.tensor([req.output_ids[-1] for req in batch.reqs], ...)
+batch.prepare_for_decode(skip_prepare=False)
+```
+
+Its comment justified this by claiming `skip_prepare` "is decided from the STATIC,
+engine-level spec_algorithm". **It is not.** It is decided from the *per-batch*
+field, and upstream already handles this case in `Scheduler.update_running_batch`
+(`scheduler.py:2229-2238`):
+
+```python
+if (self.adaptive_spec_threshold is not None
+        and self.adaptive_spec_threshold > 0
+        and batch.batch_size() > self.adaptive_spec_threshold):
+    self.running_batch.spec_algorithm = SpeculativeAlgorithm.NONE
+batch.prepare_for_decode(skip_prepare=not self.running_batch.spec_algorithm.is_none())
+```
+
+Upstream sets `spec_algorithm = NONE` *precisely so that* `skip_prepare` becomes
+False and the real preparation runs. Our patch then ran it a **second time** in the
+same decode round. (Confirmed by diff that this scheduler block is upstream; our
+only edit to `scheduler.py` is the `SGLANG_TOLERATE_KV_LEAK` hatch.)
+
+**Why that corrupts output.** `prepare_for_decode`'s body calls
+`alloc_for_decode`, which allocates one fresh KV slot per request, writes it into
+`req_to_token_pool` at `locs = seq_lens`, and then does `seq_lens.add_(1)`. Run
+twice per round:
+
+- call 1 allocates slot **A**, maps it at position `L`, `seq_lens: L -> L+1`
+- call 2 allocates slot **B**, maps it at `L+1`, `seq_lens: L+1 -> L+2`
+- the forward pass writes this step's token KV to `out_cache_loc` = **B**
+
+Slot **A** is therefore allocated, mapped into the request's token table, inside
+`seq_lens`, **never written, and never freed**. Every decode step splices one
+phantom token of whatever stale KV the allocator last left there -- typically
+another request's freed KV -- into the attention context, and `seq_lens` advances
+2 per generated token.
+
+**Why it only bit at production scale.** The downgrade path is taken only when
+`batch_size > bs_threshold` (default 32). At 256x5 there are ~1280 concurrent
+requests, so it fires on nearly every decode step; at smoke scale (8x5) the batch
+drops below 32, speculation engages properly, and the normal path is clean. That
+is why acceptance looked healthy (2.05-8.50) at smoke scale while production
+collapsed totally. It also retires the "regression after `75df8ae`" suspicion:
+`0f7c378` predates `75df8ae`, and `75df8ae` is simply what first made
+production-scale batches runnable at all. The bug was latent, not new.
+
+**The fix.** Read `batch.spec_algorithm.is_none()` *before* clobbering the field --
+it is an exact predicate for "the scheduler already prepared this batch this
+round", since nothing ever restores that field -- and skip the redundant
+preparation. The manual preparation is kept only for the case upstream genuinely
+does not cover: `batch_size <= threshold`, reached via the warmup /
+`pending_transition_to_sd` branches of `should_enable_sd()`, which is the
+`batch_size=20` crash `0f7c378` was written for.
+
+**Measured, greedy, single-turn, 2 GPUs, 128x5, `gpu_memory_utilization=0.45` --
+identical config in all three arms, only the code differs:**
+
+| arm | non-ASCII chars | per 1k chars | mean resp chars | `</sql>` never closed | uniq of 5 |
+|---|---|---|---|---|---|
+| SD-off | 10 | 0.01 | 1098 | 3.4% | 1.49 |
+| SD-on, **pre-fix** | 102,415 | 27.96 | 5722 | **88.6%** | 4.69 |
+| SD-on, **post-fix** | 10 | 0.01 | 1156 | 5.0% | 1.73 |
+
+The pre-fix arm was re-run at the *new* config specifically to rule out the
+GPU-count/batch change as the explanation. It reproduces the corruption there, so
+the attribution is to the code, not the config.
+
+**Bitwise (greedy), same config:**
+
+| comparison | exact match |
+|---|---|
+| SD-off vs SD-off (two runs) | **128/128 = 1.000** |
+| SD-on vs SD-on (two runs) | 127/128 = 0.992 |
+| SD-on vs SD-off, pre-fix | 0/256 = 0.000 (median divergence char 6) |
+| SD-on vs SD-off, post-fix | 56/128 = 0.438 (median divergence char 154) |
+
+**On the residual 0.438 -- stated honestly.** The engine is run-to-run
+deterministic (SD-off vs SD-off is exactly 1.000), so 1.000 is the real ceiling and
+post-fix SD is *not* bit-identical to non-SD. What the evidence does show is that
+the residual is a different phenomenon from the corruption: junk tokens are gone
+entirely (10, exactly the SD-off count), mean length matches (1156 vs 1098 vs the
+pre-fix 5722), the divergences are coherent alternative continuations rather than
+spliced garbage, and the fixed SD path is itself deterministic at 0.992. The
+natural explanation is floating-point: the verify step runs the target model over
+several candidate tokens at once, so kernel shapes and reduction order differ from
+single-token decode and argmax flips on near-ties. This engine is *demonstrably*
+that sensitive -- with SD off entirely, the same prompt repeated 5 times in one
+batch already yields 1.49 distinct greedy outputs, purely from batch position. But
+this is an inference from consistent evidence, **not** a proof that every residual
+divergence is benign numerics, and it should not be recorded as one.
+
+**Corrections to the earlier record.** Three hypotheses in `UPDATE 2026-08-30b`
+were wrong and their diagnostics have been removed: the uninitialised `predict`
+buffer (`eagle_info.py` is now byte-identical to upstream again), the
+`context_length` cap (its `FASTRL_ENGINE_CONTEXT_LEN` override is gone; the comment
+now records the refutation), and, from further back, "SD destroys GRPO diversity".
+The elimination list in `UPDATE 2026-08-30b` was sound as far as it went -- every
+item on it really was eliminated -- but all of it searched sglang, and the defect
+was in our own patch to sglang the whole time.
+
+**Still open.** The 2-token `token_to_kv_pool` accounting leak is very likely the
+same defect (slot **A** is leaked once per request per downgraded decode step), and
+`SGLANG_TOLERATE_KV_LEAK` should now be unnecessary -- but this is **unverified**:
+the leak only surfaced at step 6 of a training run and no training run has been made
+since. The hatch stays until a training run confirms it. The obvious next step is to
+re-run the 256x5 single-turn SD on/off training ablation, which pre-fix collapsed
+256/256 groups on all 5 steps and never ran a single optimizer step; that is the
+number that decides whether FastRL's SD actually delivers.

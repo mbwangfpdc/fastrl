@@ -1,5 +1,4 @@
 import logging
-import os
 from copy import copy
 from dataclasses import dataclass
 from typing import ClassVar, List, Optional, Tuple
@@ -227,23 +226,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
-        # DIAGNOSTIC (FASTRL_PREDICT_SENTINEL): `predict` is normally
-        # uninitialised, and the verify kernels only write the tree positions
-        # they actually compute -- so any accept_index pointing at a slot the
-        # kernel did not write reads whatever was in that memory. SD-on output
-        # here shows a single foreign token spliced repeatedly into otherwise
-        # correct text ("<think>ük>First teh, I will checkük if the
-        # 'ükApartükmentsük' table exists"), which is the signature of exactly
-        # that. Filling with a known token id turns the hypothesis into a
-        # test: if the injected junk changes to the sentinel, the reads are
-        # uninitialised. Unset in normal operation.
-        _sent = os.environ.get("FASTRL_PREDICT_SENTINEL")
-        if _sent:
-            predict = torch.full(
-                predict_shape, int(_sent), dtype=torch.int32, device="cuda"
-            )
-        else:
-            predict = torch.empty(predict_shape, dtype=torch.int32, device="cuda")
+        predict = torch.empty(predict_shape, dtype=torch.int32, device="cuda")
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device="cuda"
         )

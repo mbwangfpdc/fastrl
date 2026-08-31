@@ -422,38 +422,68 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             if not enable_sd:
+                # Has the scheduler ALREADY run the real decode preparation for
+                # this batch? update_running_batch() does exactly that for the
+                # part of the adaptive downgrade it can see for itself -- when
+                # batch.batch_size() > apdative_speculative_batch_size_threshold
+                # it sets running_batch.spec_algorithm = NONE and then calls
+                # prepare_for_decode(skip_prepare=not spec_algorithm.is_none()),
+                # i.e. skip_prepare=False, the real body. That field is sticky
+                # (nothing ever restores it), so `spec_algorithm.is_none()` on
+                # entry here is an exact predicate for "already prepared this
+                # round". It MUST be read before we clobber the field below.
+                #
+                # Preparing a second time is not harmless: prepare_for_decode's
+                # body calls alloc_for_decode(), which allocates a fresh KV slot
+                # per request and maps it into req_to_token at position
+                # seq_lens, and then does seq_lens.add_(1). Running it twice in
+                # one decode round therefore (a) leaks the first allocation --
+                # it stays mapped into the request's token table but the forward
+                # pass writes this step's token to the SECOND allocation, so the
+                # first slot is never written and holds whatever stale KV the
+                # allocator last left there -- and (b) advances seq_lens by 2
+                # per generated token, so attention reads that never-written
+                # slot as if it were context. That injects one phantom token of
+                # another request's KV into every decode step, which is the
+                # cause of the junk-token corruption and the token_to_kv_pool
+                # accounting leak documented in RESUME_TLT_DRAFTER.md.
+                already_prepared = batch.spec_algorithm.is_none()
+
                 # Temporarily disable spec to make target worker treat this as normal decode
                 batch.spec_algorithm = SpeculativeAlgorithm.NONE
                 batch.spec_info = None
 
-                # The scheduler's own decode preparation (ScheduleBatch.prepare_for_decode,
-                # called from get_next_batch_to_run -> update_running_batch, BEFORE we get
-                # here) skips its real body -- input_ids left un-collapsed from output_ids,
-                # out_cache_loc never (re)allocated, seq_lens never bumped -- whenever
-                # skip_prepare=True, which is decided from the STATIC, engine-level
-                # spec_algorithm (non-none for the whole life of an EAGLE-configured
-                # engine), not from this per-batch adaptive enable_sd decision. So every
-                # batch adaptively downgraded to non-speculative arrives here with a batch
-                # still shaped like whatever ran last (often a much larger extend/prefill),
-                # and gets fed downstream as if it were a normal `batch_size` decode step.
-                # Confirmed via a live repro: batch_size=20 decode step carrying an
-                # unrelated 2522-3249-token input_ids, crashing in cuda graph replay / the
-                # KV buffer setup with a shape mismatch. Run the real preparation now, since
-                # by this point we know for certain this batch is not going to speculate.
-                # prepare_for_decode's real body does `self.input_ids = self.output_ids`,
-                # trusting ScheduleBatch.output_ids -- but under an EAGLE-configured
-                # engine that batch-level field is never populated via the generic
-                # path either (that per-round "next token" bookkeeping lives in
-                # spec_info instead), so it can be None/stale here too. Rebuild it from
-                # each request's own record, the same source prepare_for_decode's own
-                # penalizer-orchestrator branch above already trusts for this exact
+                # The case the scheduler does NOT cover: batch_size <= threshold,
+                # reached via the warmup / pending_transition_to_sd branches of
+                # should_enable_sd(). update_running_batch()'s downgrade test is
+                # purely `batch_size > threshold`, so for those batches it leaves
+                # spec_algorithm non-none, passes skip_prepare=True, and
+                # prepare_for_decode returns before its real body -- input_ids
+                # left un-collapsed from output_ids, out_cache_loc never
+                # (re)allocated, seq_lens never bumped. The batch then arrives
+                # here still shaped like whatever ran last (often a much larger
+                # extend/prefill) and would be fed downstream as if it were a
+                # normal `batch_size` decode step. Confirmed via a live repro:
+                # batch_size=20 decode step carrying an unrelated 2522-3249-token
+                # input_ids, crashing in cuda graph replay / the KV buffer setup
+                # with a shape mismatch. Run the real preparation now, since by
+                # this point we know this batch is not going to speculate.
+                #
+                # prepare_for_decode's real body does `self.input_ids =
+                # self.output_ids`, trusting ScheduleBatch.output_ids. On this
+                # branch the batch has been speculating, so its per-round "next
+                # token" bookkeeping lives in spec_info and that batch-level
+                # field can be None or stale. Rebuild it from each request's own
+                # record -- the same source prepare_for_decode's own
+                # penalizer-orchestrator branch already trusts for this exact
                 # purpose (req.output_ids[-1]).
-                batch.output_ids = torch.tensor(
-                    [req.output_ids[-1] for req in batch.reqs],
-                    dtype=torch.int64,
-                    device=batch.device,
-                )
-                batch.prepare_for_decode(skip_prepare=False)
+                if not already_prepared:
+                    batch.output_ids = torch.tensor(
+                        [req.output_ids[-1] for req in batch.reqs],
+                        dtype=torch.int64,
+                        device=batch.device,
+                    )
+                    batch.prepare_for_decode(skip_prepare=False)
 
                 model_worker_batch = batch.get_model_worker_batch()
 

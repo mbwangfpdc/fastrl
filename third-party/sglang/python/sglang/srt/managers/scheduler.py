@@ -1775,13 +1775,17 @@ class Scheduler(
             # Two tokens out of ~136k is 0.0015% and cannot exhaust the pool
             # over a run of this length, but the check raises regardless and
             # takes the whole job with it. The underlying accounting bug is
-            # real and NOT fixed here -- it appears specific to the
-            # single-turn path (10-step multi-turn production runs never hit
-            # it), the same under-tested path that produced the
-            # release_memory() hang fixed in b793853. This escape hatch exists
-            # so a diagnostic ablation can complete; it is off by default so
-            # nothing else changes behaviour, and it must NOT be set for a run
-            # whose memory accounting you actually care about.
+            # real. It is very likely the same defect as the SD output
+            # corruption: the adaptive-downgrade path in eagle_worker.py used to
+            # run prepare_for_decode twice per decode round, and each
+            # prepare_for_decode calls alloc_for_decode, so the first
+            # allocation's slots were orphaned -- allocated, mapped into
+            # req_to_token, never written and never freed. That fix should make
+            # this leak go away, but it has NOT been confirmed: the leak only
+            # surfaced at step 6 of a training run, and no training run has been
+            # made since. Until it is, this escape hatch stays; it is off by
+            # default so nothing else changes behaviour, and it must NOT be set
+            # for a run whose memory accounting you actually care about.
             if os.environ.get("SGLANG_TOLERATE_KV_LEAK", "") not in ("", "0", "false", "False"):
                 logger.warning("[tolerated] %s", msg)
             else:
