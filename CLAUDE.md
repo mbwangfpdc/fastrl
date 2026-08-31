@@ -117,6 +117,22 @@ almost certainly the same defect but is **unverified** - `SGLANG_TOLERATE_KV_LEA
 stays until a training run confirms. Next: re-run the 256x5 single-turn SD on/off
 training ablation, which pre-fix collapsed 256/256 groups every step.
 
+**2026-08-31 (later) — that "most likely verify-step batch-shape numerics" guess
+just failed its first real test.** Read `### UPDATE 2026-08-31b` in
+`RESUME_TLT_DRAFTER.md`. A true batch=1 isolation run (one prompt per rollout
+engine, zero concurrent requests to cause batch-position noise) still only hits
+2/4 bitwise match, diverging early into a different coherent continuation, not a
+near-tie flip. And `should_enable_sd()` doesn't downgrade below `bs_threshold=32`,
+so this test ran almost entirely through the ordinary SD decode path -- the code
+neither of our two fixes touched, confirmed unmodified upstream code via
+`git log --follow`. So the residual gap is not a rounding artifact of the bug we
+just fixed and not explained by batch-position noise; it's either a real defect in
+FastRL's mainline verify/accept path or a floating-point-drift claim that still
+needs proving, not assuming. Next: an independent Python re-walk of
+`verify_tree_greedy`'s own inputs (`candidates`/`target_predict`/tree pointers),
+diffed against its output, to settle kernel-logic-bug vs. context/numerics before
+going further.
+
 ## Running it
 
 `examples/grpo_sql_baseline.sh` is the entry point; every execution knob is an

@@ -36,6 +36,18 @@ path for the NCCL collective timeout), and a real quality finding -- the
 paper's own base-model pairing basically doesn't learn on this workload in 10
 steps, unlike the Coder-Instruct target used elsewhere in this comparison.
 
+**UPDATED 2026-08-31 (Oscar, later)** — the residual 0.438 bitwise-match gap
+from `### UPDATE 2026-08-31` is NOT explained by cross-request batch-position
+noise, and it is NOT confined to the just-fixed downgrade path. Read
+`### UPDATE 2026-08-31b` below: a true batch=1 isolation test (one prompt per
+rollout engine, zero other concurrent requests) still diverges (2/4 exact
+match), diverging early and into semantically different continuations, not a
+recoverable near-tie flip -- and at batch_size=4, comfortably under
+`bs_threshold=32`, the run spends essentially all its time in the ordinary,
+never-patched SD decode path, not the branch either of our two fixes touched.
+The "benign verify-step floating point" framing from `### UPDATE 2026-08-31`
+should be treated as unconfirmed, not as the answer.
+
 ---
 
 ## STATUS 2026-08-25 — read this before the older sections
@@ -953,3 +965,74 @@ since. The hatch stays until a training run confirms it. The obvious next step i
 re-run the 256x5 single-turn SD on/off training ablation, which pre-fix collapsed
 256/256 groups on all 5 steps and never ran a single optimizer step; that is the
 number that decides whether FastRL's SD actually delivers.
+
+### UPDATE 2026-08-31b (Oscar): the residual gap survives true batch=1 -- it lives in the ORDINARY SD decode path, not the branch either fix touched
+
+`### UPDATE 2026-08-31`'s honest-but-unproven theory for the residual 0.438
+bitwise-match rate was verify-step floating-point numerics, flagged alongside a
+real confound: even with SD off entirely, 5 copies of one prompt in a batch
+already yield only 1.49 distinct greedy outputs, so some of that gap could be
+generic batch-position noise rather than anything SD-specific. This isolates
+that confound directly.
+
+**The test.** `scripts/run_tlt_batch1_probe_slurm.sh` (new; SPECULATIVE-
+parameterized, single script for both arms, same discipline as
+`run_tlt_singleturn_prod_local.sh`). `ray_trainer.py`'s config validation
+rejects `train_batch_size=1` outright (`real_train_batch_size must be
+divisible by minimal possible batch size`, which is `n_gpus`=4 here), so true
+single-request `train_batch_size=1` is unreachable at this topology --
+`TRAIN_PROMPT_BSZ=4 N_RESP=1` is the smallest config that clears it. With
+`NGPUS=4 TP=1` the rollout pool is 4 independent single-GPU sglang engines, and
+4 DISTINCT prompts split one-per-engine still means each engine handles
+exactly one concurrent request at a time -- true batch=1 at the level that
+actually generates text, with no duplicate-prompt or cross-request effect
+possible at all. Single-turn, greedy (`temperature=0`), `DATA_SHUFFLE=False`
+so both arms see the identical 4 prompts.
+
+**Result:** `compare_runs_bitwise.py` on the two 4-row dumps: **2/4 exact
+match**, first divergence at char 204 and 589 (median 396). Both divergent
+examples switch to a different, coherent alternative continuation entirely
+(a different table/column name), not a one-token near-tie that recovers a
+line later.
+
+**What this rules out.** 2/4 at n=4 is statistically consistent with the
+production-scale 56/128=0.438 measured in `UPDATE 2026-08-31` -- the same
+phenomenon, not a different one -- and it happens with ZERO other requests
+sharing the batch. Cross-request batch-position noise, the confound
+`UPDATE 2026-08-31` flagged as unresolved, cannot be the (sole) explanation:
+it isn't present here at all, yet the gap persists at essentially the same
+rate.
+
+**Where in the code this actually runs.** `should_enable_sd()`'s downgrade
+test is `batch_size > bs_threshold` (32); at `batch_size=4` it returns `True`
+for essentially the entire run, so `forward_batch_generation` takes the
+`enable_sd` branch (`eagle_worker.py:523+`) almost the whole time, never the
+`if not enable_sd:` block either of our two commits (`0f7c378`, `5791c8b`)
+touched. `git log --follow` on `eagle_worker.py` shows exactly four commits:
+`be268f0` (vendoring), `229ef27` (upstream, "add normal cuda graph for target
+model", authored by an upstream FastRL contributor), and our two fixes -- both
+confined to the `if not enable_sd:` block. Everything this test actually
+exercised is unmodified upstream code. So the residual gap is not a leftover
+edge of the bug we just fixed; it is either a genuine defect in FastRL's
+mainline SD verify/accept path, or real (not yet demonstrated) floating-point
+drift in the verify step's multi-candidate forward pass -- `UPDATE 2026-08-31`
+was right to flag the latter as unconfirmed rather than settled.
+
+**What would settle it next (not yet done).** The greedy accept decision
+(`eagle_info.py::verify`, `is_all_greedy` branch) computes `target_predict =
+argmax(logits)` over every candidate position in Python, then hands it to the
+compiled `verify_tree_greedy` kernel to walk the tree and pick the accepted
+run -- both are already-refuted suspects from `UPDATE 2026-08-30b`'s
+elimination list (uninitialised `predict` buffer; the stochastic accept kernel
+under sampling, though not specifically re-checked post-fix under greedy at
+this small a scale). Two concrete next steps, in order of cost: (1) an
+independent Python re-walk of the same `candidates` / `target_predict` /
+`retrive_next_token` / `retrive_next_sibling` tensors the kernel already
+computed, diffed against its own `accept_index`/`accept_length` output --
+proves or disproves a kernel-logic bug without touching CUDA; (2) if that
+comes back clean, the remaining question is whether `target_predict` itself
+(the target model's logits at each candidate position) matches what a plain
+non-speculative decode would compute at the identical context -- if it does
+NOT, that is context corruption, a bug of the same family as the one just
+fixed; if it DOES, the floating-point-drift theory is confirmed rather than
+just plausible.
