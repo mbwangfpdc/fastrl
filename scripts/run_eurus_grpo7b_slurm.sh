@@ -39,6 +39,12 @@ ulimit -u "$(ulimit -Hu)"
 module load cuda/12.9.0-cinr
 export RAY_OVERRIDE_RESOURCES="{\"CPU\":$SLURM_CPUS_PER_TASK}"
 unset VIRTUAL_ENV UV_PROJECT_ENVIRONMENT || true
+# Build the venv on this node if it doesn't exist yet (the CPU queues can be
+# hours deep; building here costs ~20-30 min of idle GPU time instead).
+if [ ! -x "$REPO/.venv/bin/python" ] || ! "$REPO/.venv/bin/python" -c "import verl, sglang" 2>/dev/null; then
+  echo "=== building $REPO/.venv on $(hostname) ==="
+  bash "$REPO/scripts/setup_env_core_slurm.sh"
+fi
 source "$REPO/.venv/bin/activate"
 export HF_HOME=${HF_HOME:-/users/mborjigi/data/mborjigi/hf}
 export TOKENIZERS_PARALLELISM=true NCCL_DEBUG=WARN MKL_SERVICE_FORCE_INTEL=1 PYTHONUNBUFFERED=1
