@@ -7,7 +7,7 @@
 #
 # This node (Oscar) has no /local_nvme*; INSTALL-uv.md and
 # eagle-train/install_uv.sh were written on a different box, so cache/HF dirs
-# are overridden below to live under /oscar/scratch.
+# are overridden below to live under the repo (/oscar/data).
 #
 #   sbatch scripts/setup_env_slurm.sh
 #
@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-REPO=/oscar/scratch/mborjigi/fastrl
+REPO=/oscar/data/deeptir/mborjigi/fastrl
 cd "$REPO"
 
 echo "node=$(hostname) nproc_all=$(nproc --all)"
@@ -41,7 +41,7 @@ echo "node=$(hostname) nproc_all=$(nproc --all)"
 unset VIRTUAL_ENV UV_PROJECT_ENVIRONMENT || true
 
 # /local_nvme1 (the box INSTALL-uv.md was written on) does not exist on
-# Oscar -- point the uv cache and HF cache at scratch instead.
+# Oscar -- point the uv cache at the repo and HF at /oscar/data instead.
 export UV_CACHE_DIR="$REPO/.cache/uv"
 export HF_HOME=${HF_HOME:-/users/mborjigi/data/mborjigi/hf}
 mkdir -p "$UV_CACHE_DIR"

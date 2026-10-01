@@ -43,7 +43,7 @@
 
 set -uo pipefail
 
-REPO=/oscar/scratch/mborjigi/fastrl
+REPO=/oscar/data/deeptir/mborjigi/fastrl
 cd "$REPO"
 
 echo "node=$(hostname) job=$SLURM_JOB_ID gpus=${SLURM_JOB_GPUS:-?}"
