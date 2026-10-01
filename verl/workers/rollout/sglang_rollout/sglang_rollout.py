@@ -1054,6 +1054,13 @@ class SGLangRollout(BaseRollout):
                 )
             except asyncio.TimeoutError:
                 logger.info(f"Worker {current_worker_id} timed out marking as completed")
+            except RuntimeError as e:
+                # LOCAL PATCH: the drafter manager's asyncio.Lock is shared with a
+                # coordinator thread's event loop; if that loop holds it here, acquiring
+                # it from this loop raises "bound to a different event loop" and killed
+                # job 6925955 at step 2. The mark only feeds drafter scheduling, so skip
+                # it the same way a timeout is skipped.
+                logger.warning(f"Worker {current_worker_id} could not mark completed ({e}); continuing")
 
             # Wait for training cleanup to complete before next batch using efficient event-based waiting.
             # This is much faster than polling and only blocks if this worker is actually training.
