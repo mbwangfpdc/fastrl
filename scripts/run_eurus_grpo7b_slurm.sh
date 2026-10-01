@@ -9,6 +9,8 @@
 #     PRIME-RL/Eurus-2-RL-Data parquet files the script expects)
 #   - trainer.total_training_steps=$STEPS instead of a full epoch
 #   - trainer.save_freq=-1 (no checkpoints)
+#   - sglang attention_backend=flashinfer (its default FA3 backend requires
+#     SM 8.0-9.0; B200 is SM 10.0)
 #   - trainer.n_gpus_per_node=4 instead of 8 (batch sizes are global, so the RL
 #     problem is unchanged; rollout TP 4 = one engine, Ulysses SP 4 = one DP group)
 #
@@ -102,6 +104,7 @@ python3 -m verl.trainer.main_fastrl \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.name=sglang \
+    actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=flashinfer \
     actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
