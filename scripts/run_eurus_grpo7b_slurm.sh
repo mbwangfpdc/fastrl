@@ -12,6 +12,7 @@
 #   - sglang attention_backend=triton (its default FA3 backend requires
 #     SM 8.0-9.0, B200 is SM 10.0; flashinfer JIT fails on a tvm-ffi API mismatch;
 #     triton is what the earlier FastRL SQL runs used)
+#   - rollout.enforce_eager=False (CUDA graphs on; verl defaults to eager)
 #   - trainer.n_gpus_per_node=4 instead of 8 (batch sizes are global, so the RL
 #     problem is unchanged; rollout TP 4 = one engine, Ulysses SP 4 = one DP group)
 #
@@ -106,6 +107,7 @@ python3 -m verl.trainer.main_fastrl \
     actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
+    actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
