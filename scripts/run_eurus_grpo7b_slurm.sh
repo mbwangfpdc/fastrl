@@ -8,7 +8,7 @@
 #   - data paths -> /users/mborjigi/data/datasets/eurus2_rl (the same
 #     PRIME-RL/Eurus-2-RL-Data parquet files the script expects)
 #   - trainer.total_training_steps=$STEPS instead of a full epoch
-#   - trainer.save_freq=-1 (no checkpoints)
+#   - trainer.save_freq=$SAVE_FREQ (default -1 = no checkpoints), HF weights only
 #   - sglang attention_backend=triton (its default FA3 backend requires
 #     SM 8.0-9.0, B200 is SM 10.0; flashinfer JIT fails on a tvm-ffi API mismatch;
 #     triton is what the earlier FastRL SQL runs used)
@@ -36,6 +36,10 @@ set -euo pipefail
 REPO=/oscar/data/deeptir/mborjigi/fastrl
 cd "$REPO"
 STEPS=${STEPS:-3}
+# SAVE_FREQ>0 saves HF-format actor weights only (no optimizer) under output/ckpt;
+# ROLLOUT_DIR set -> verl dumps every rollout (jsonl per step) there.
+SAVE_FREQ=${SAVE_FREQ:--1}
+ROLLOUT_DIR=${ROLLOUT_DIR:-null}
 echo "node=$(hostname) job=$SLURM_JOB_ID steps=$STEPS"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv || true
 
@@ -125,7 +129,9 @@ python3 -m verl.trainer.main_fastrl \
     trainer.val_before_train=False \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=-1 \
+    trainer.save_freq=$SAVE_FREQ \
+    "actor_rollout_ref.actor.checkpoint.save_contents=['hf_model']" \
+    trainer.rollout_data_dir=$ROLLOUT_DIR \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
     trainer.total_training_steps=$STEPS
