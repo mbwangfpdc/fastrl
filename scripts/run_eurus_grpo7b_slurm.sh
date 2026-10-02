@@ -4,7 +4,7 @@
 # 1 node x 8 GPUs), run on 4 Oscar B200s to compare its rollout/response-length
 # dynamics with granular-cais-rl's port. Every training argument is copied from
 # grpo_7B.sh; the ONLY changes are:
-#   - speculative.enable=false  (measure training dynamics, not the drafter)
+#   - speculative.enable=$SPEC (default false: measure training dynamics, not the drafter)
 #   - data paths -> /users/mborjigi/data/datasets/eurus2_rl (the same
 #     PRIME-RL/Eurus-2-RL-Data parquet files the script expects)
 #   - trainer.total_training_steps=$STEPS instead of a full epoch
@@ -39,8 +39,10 @@ STEPS=${STEPS:-3}
 # SAVE_FREQ>0 saves HF-format actor weights only (no optimizer) under output/ckpt;
 # ROLLOUT_DIR set -> verl dumps every rollout (jsonl per step) there.
 SAVE_FREQ=${SAVE_FREQ:--1}
+# SPEC=true runs grpo_7B.sh's own speculative decoding (EAGLE drafter, bs_threshold 32).
+SPEC=${SPEC:-false}
 ROLLOUT_DIR=${ROLLOUT_DIR:-null}
-echo "node=$(hostname) job=$SLURM_JOB_ID steps=$STEPS"
+echo "node=$(hostname) job=$SLURM_JOB_ID steps=$STEPS spec=${SPEC:-false}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv || true
 
 ulimit -u "$(ulimit -Hu)"
@@ -77,7 +79,7 @@ sleep 3
 
 python3 -m verl.trainer.main_fastrl \
     speculative.eagle.spec_model_path=$SPEC_MODEL_PATH \
-    speculative.enable=false \
+    speculative.enable=$SPEC \
     speculative.bs_threshold=32 \
     data.train_files=$DATA_PATH/train.parquet \
     data.val_files=$DATA_PATH/validation.parquet \
